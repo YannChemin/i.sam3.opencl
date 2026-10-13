@@ -206,17 +206,20 @@ void image_read_group(const char *group, const char *subgroup, double lo,
     progress_end();
 }
 
-/* PIL's 8-bit bilinear resampling (Resample.c): per-output-pixel
- * triangle filter widened by the downscale factor, coefficients in
- * 22-bit fixed point, horizontal pass first, each pass rounded and
- * clipped to 8 bits. torchvision resizes uint8 images the same way
- * (antialias=True), which is what Sam3Processor.set_image() does
- * before converting to float. */
+/* torchvision's 8-bit bilinear resampling with antialias, which is what
+ * Sam3Processor.set_image() runs before converting to float: PyTorch's
+ * CPU uint8 kernel (UpSampleKernel.cpp, _compute_index_ranges_int16_weights,
+ * and UpSampleKernelAVXAntialias.h), itself adapted from PIL. Per output
+ * pixel, a triangle filter widened by the downscale factor; horizontal
+ * pass first, each pass rounded and clipped to 8 bits. Unlike PIL's fixed
+ * 22 bits, the weights' fixed-point precision is per axis: the largest
+ * one at which the biggest weight still fits in int16. */
 
-#define PRECISION_BITS (32 - 8 - 2)
+#define MAX_PRECISION_BITS 22
 
 struct coeffs {
     int ksize;
+    int prec;    /* Fixed-point precision of kk. */
     int *bounds; /* xmin, count per output pixel. */
     int *kk;     /* ksize fixed-point weights per output pixel. */
 };
@@ -226,16 +229,17 @@ static void precompute_coeffs(int in, int out, struct coeffs *c)
     double scale = (double)in / out;
     double filterscale = scale < 1.0 ? 1.0 : scale;
     double support = 1.0 * filterscale, ss = 1.0 / filterscale;
-    double *k;
+    double *w = NULL, wt_max = 0.0;
     int xx, x;
 
     c->ksize = (int)ceil(support) * 2 + 1;
     c->bounds = G_malloc(2 * out * sizeof(int));
     c->kk = G_calloc((size_t)out * c->ksize, sizeof(int));
-    k = G_malloc(c->ksize * sizeof(double));
+    w = G_calloc((size_t)out * c->ksize, sizeof(double));
 
     for (xx = 0; xx < out; xx++) {
         double center = (xx + 0.5) * scale, ww = 0.0;
+        double *k = w + (size_t)xx * c->ksize;
         int xmin = (int)(center - support + 0.5);
         int xmax = (int)(center + support + 0.5);
 
@@ -244,36 +248,48 @@ static void precompute_coeffs(int in, int out, struct coeffs *c)
         if (xmax > in)
             xmax = in;
         xmax -= xmin;
+        /* Rounding can make the window one wider than the kernel. */
+        if (xmax > c->ksize)
+            xmax = c->ksize;
+        if (xmax < 0)
+            xmax = 0;
         for (x = 0; x < xmax; x++) {
             double t = fabs((x + xmin - center + 0.5) * ss);
-            double w = t < 1.0 ? 1.0 - t : 0.0;
 
-            k[x] = w;
-            ww += w;
+            k[x] = t < 1.0 ? 1.0 - t : 0.0;
+            ww += k[x];
         }
-        for (x = 0; x < xmax; x++) {
-            double v = ww != 0.0 ? k[x] / ww : k[x];
-
-            c->kk[(size_t)xx * c->ksize + x] =
-                v < 0 ? (int)(-0.5 + v * (1 << PRECISION_BITS))
-                      : (int)(0.5 + v * (1 << PRECISION_BITS));
-        }
+        if (ww != 0.0)
+            for (x = 0; x < xmax; x++) {
+                k[x] /= ww;
+                if (k[x] > wt_max)
+                    wt_max = k[x];
+            }
         c->bounds[2 * xx] = xmin;
         c->bounds[2 * xx + 1] = xmax;
     }
-    G_free(k);
+
+    for (c->prec = 0; c->prec < MAX_PRECISION_BITS; c->prec++)
+        if ((int)(0.5 + wt_max * (1 << (c->prec + 1))) >= (1 << 15))
+            break;
+    for (xx = 0; xx < out * c->ksize; xx++) {
+        double v = w[xx] * (1 << c->prec);
+
+        c->kk[xx] = v < 0 ? (int)(-0.5 + v) : (int)(0.5 + v);
+    }
+    G_free(w);
 }
 
-static unsigned char clip8(int64_t v)
+static unsigned char clip8(int64_t v, int prec)
 {
-    v >>= PRECISION_BITS;
+    v >>= prec;
     return v < 0 ? 0 : v > 255 ? 255 : (unsigned char)v;
 }
 
 /* Resize an interleaved 3-channel image (w x h, row stride stride
  * pixels) to nw x nh. */
-static unsigned char *pil_resize(const unsigned char *src, int w, int h,
-                                 int stride, int nw, int nh)
+static unsigned char *aa_resize(const unsigned char *src, int w, int h,
+                                int stride, int nw, int nh)
 {
     struct coeffs cx, cy;
     unsigned char *tmp, *dst;
@@ -291,13 +307,13 @@ static unsigned char *pil_resize(const unsigned char *src, int w, int h,
             int xmin = cx.bounds[2 * x], cnt = cx.bounds[2 * x + 1];
 
             for (c = 0; c < 3; c++) {
-                int64_t ss = 1 << (PRECISION_BITS - 1);
+                int64_t ss = (int64_t)1 << (cx.prec - 1);
 
                 for (i = 0; i < cnt; i++)
                     ss +=
                         (int64_t)src[((size_t)y * stride + xmin + i) * 3 + c] *
                         k[i];
-                tmp[((size_t)y * nw + x) * 3 + c] = clip8(ss);
+                tmp[((size_t)y * nw + x) * 3 + c] = clip8(ss, cx.prec);
             }
         }
     }
@@ -309,12 +325,12 @@ static unsigned char *pil_resize(const unsigned char *src, int w, int h,
 
         for (x = 0; x < nw; x++) {
             for (c = 0; c < 3; c++) {
-                int64_t ss = 1 << (PRECISION_BITS - 1);
+                int64_t ss = (int64_t)1 << (cy.prec - 1);
 
                 for (i = 0; i < cnt; i++)
                     ss += (int64_t)tmp[((size_t)(ymin + i) * nw + x) * 3 + c] *
                           k[i];
-                dst[((size_t)y * nw + x) * 3 + c] = clip8(ss);
+                dst[((size_t)y * nw + x) * 3 + c] = clip8(ss, cy.prec);
             }
         }
     }
@@ -336,7 +352,7 @@ void image_encoder_input(const struct sam_image *img, int x0, int y0, int w,
 
     /* Resampling is skipped when the size is unchanged. */
     if (w != SAM_IMG || h != SAM_IMG) {
-        rs = pil_resize(src, w, h, img->cols, SAM_IMG, SAM_IMG);
+        rs = aa_resize(src, w, h, img->cols, SAM_IMG, SAM_IMG);
         src = rs;
         stride = SAM_IMG;
     }

@@ -79,7 +79,9 @@ layer 1, 16 in layer 2, ...), prompted with **points_per_side** divided
 by **crop_points_downscale** per layer.
 
 Each crop is resized to 1008 x 1008 pixels, regardless of its aspect
-ratio, as SAM 3 does, and passed through the image encoder. The mask
+ratio, as SAM 3 does (the 8-bit antialiased bilinear resize of
+torchvision, reproduced to the bit), and passed through the image
+encoder. The mask
 decoder is then prompted with a grid of **points_per_side** x
 **points_per_side** points, **batch** prompts at a time, returning three
 candidate masks per point. A mask is kept if its predicted IoU exceeds

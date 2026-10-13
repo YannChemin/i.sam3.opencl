@@ -67,7 +67,9 @@ than 0, each tile is additionally segmented in zoomed-in sub-crops (4 in
 layer 1, 16 in layer 2, ...), prompted with <b>points_per_side</b> divided
 by <b>crop_points_downscale</b> per layer.</p>
 <p>Each crop is resized to 1008 x 1008 pixels, regardless of its aspect
-ratio, as SAM 3 does, and passed through the image encoder. The mask
+ratio, as SAM 3 does (the 8-bit antialiased bilinear resize of
+torchvision, reproduced to the bit), and passed through the image
+encoder. The mask
 decoder is then prompted with a grid of <b>points_per_side</b> x
 <b>points_per_side</b> points, <b>batch</b> prompts at a time, returning three
 candidate masks per point. A mask is kept if its predicted IoU exceeds
