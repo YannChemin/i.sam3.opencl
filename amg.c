@@ -22,6 +22,7 @@
 #include <grass/glocale.h>
 
 #include "amg.h"
+#include "tokenizer.h"
 
 /* Masks whose box lies within this many cells of an inner crop edge are
  * discarded (is_box_near_crop_edge atol). */
@@ -175,7 +176,10 @@ static void nms(struct mask_list *l, const double *s1, const double *s2,
         for (j = i + 1; j < l->n; j++) {
             int b = o[j].idx;
 
-            if (!dead[b] && box_iou(&l->v[a], &l->v[b]) > thresh)
+            /* Masks of different text prompts never suppress each
+             * other (batched_nms categories). */
+            if (!dead[b] && l->v[a].label == l->v[b].label &&
+                box_iou(&l->v[a], &l->v[b]) > thresh)
                 dead[b] = 1;
         }
     }
@@ -400,13 +404,120 @@ static void dump_floats(const char *dir, const char *what, int crop,
     fclose(fp);
 }
 
+/* Keep postprocessed mask k of a crop unless it is empty or touches an
+ * inner crop edge (is_box_near_crop_edge); st holds its statistics. */
+static void accept_mask(struct sam_model *m, const struct sam_image *img,
+                        const struct crop *c, int k, const int *st, float score,
+                        int label, struct mask_list *cl)
+{
+    const int W = img->cols, H = img->rows;
+    const int w = c->x1 - c->x0, h = c->y1 - c->y0;
+    double bx[4], cb[4], ob[4] = {0, 0, W, H};
+    struct sam_mask mk;
+    int e;
+
+    if (st[4] < 0)
+        return; /* Empty mask. */
+    mk.x0 = c->x0 + st[2];
+    mk.y0 = c->y0 + st[3];
+    mk.x1 = c->x0 + st[4];
+    mk.y1 = c->y0 + st[5];
+    bx[0] = mk.x0;
+    bx[1] = mk.y0;
+    bx[2] = mk.x1;
+    bx[3] = mk.y1;
+    cb[0] = c->x0;
+    cb[1] = c->y0;
+    cb[2] = c->x1;
+    cb[3] = c->y1;
+    for (e = 0; e < 4; e++)
+        if (fabs(bx[e] - cb[e]) <= EDGE_ATOL &&
+            !(fabs(bx[e] - ob[e]) <= EDGE_ATOL))
+            return;
+    mk.m = G_malloc((size_t)(st[4] - st[2] + 1) * (st[5] - st[3] + 1));
+    sam_read_mask(m, k, h, w, st[2], st[3], st[4], st[5], mk.m);
+    mk.iou = score;
+    mk.stability = st[1] > 0 ? (float)st[0] / st[1] : 0.0f;
+    mk.crop_score = 1.0 / ((double)w * h);
+    mk.area = 0;
+    mk.label = label;
+    list_push(cl, &mk);
+}
+
+/* Search one crop for the text prompts (Sam3Processor.set_text_prompt:
+ * every query whose score exceeds the threshold, no NMS). */
+static void text_crop(struct sam_model *m, const struct sam_image *img,
+                      const struct crop *c, int ci, const struct amg_params *p,
+                      float *encbuf, struct mask_list *out)
+{
+    const int w = c->x1 - c->x0, h = c->y1 - c->y0;
+    const int cap = text_mask_capacity(p->text);
+    int qidx[TEXT_QUERIES], *sel = G_malloc(cap * sizeof(int));
+    int *stats = G_malloc(6 * (size_t)cap * sizeof(int));
+    float score[TEXT_QUERIES];
+    int k, n, b, i, before = out->n;
+    double t0 = now();
+
+    image_encoder_input(img, c->x0, c->y0, w, h, encbuf);
+    sam_encode_trunk(m, encbuf);
+    text_set_image(p->text);
+    clFinish(m->ocl->queue);
+    G_verbose_message(_("Image encoder: %.2f s"), now() - t0);
+    if (p->dump_dir) {
+        size_t ne = (size_t)SAM_GRID * SAM_GRID * SAM_DIM;
+        float *feat = G_malloc(ne * sizeof(float));
+        float *txt = G_malloc(TOK_CONTEXT * SAM_DIM * sizeof(float));
+        char path[GPATH_MAX];
+        FILE *fp;
+        int y, ntok;
+
+        snprintf(path, sizeof(path), "%s/crop%03d_rgb_%dx%d.u8", p->dump_dir,
+                 ci, h, w);
+        fp = fopen(path, "wb");
+        if (!fp)
+            G_fatal_error(_("Unable to write debug dump <%s>"), path);
+        for (y = 0; y < h; y++)
+            fwrite(img->rgb + ((size_t)(c->y0 + y) * img->cols + c->x0) * 3, 3,
+                   w, fp);
+        fclose(fp);
+        dump_floats(p->dump_dir, "input", ci, encbuf, 3L * SAM_IMG * SAM_IMG);
+        text_read_features(p->text, feat, txt, &ntok);
+        dump_floats(p->dump_dir, "detector", ci, feat, ne);
+        dump_floats(p->dump_dir, "text", ci, txt, (size_t)ntok * SAM_DIM);
+        G_free(feat);
+        G_free(txt);
+    }
+
+    for (k = 0; k < p->nprompts; k++) {
+        G_percent(k, p->nprompts, 1);
+        t0 = now();
+        n = text_detect(p->text, k, (float)p->text_thresh, qidx, score);
+        for (b = 0; b < n; b += cap) {
+            int cnt = n - b < cap ? n - b : cap;
+
+            for (i = 0; i < cnt; i++)
+                sel[i] = i;
+            text_masks(p->text, cnt, qidx + b);
+            sam_postprocess(m, cnt, sel, h, w, (float)p->stability_offset, 0,
+                            stats);
+            for (i = 0; i < cnt; i++)
+                accept_mask(m, img, c, i, stats + 6 * i, score[b + i], k, out);
+        }
+        G_verbose_message(_("Prompt %d: %d detections, %.2f s"), k + 1, n,
+                          now() - t0);
+    }
+    G_percent(1, 1, 1);
+    G_verbose_message(_("Crop %d: %d masks kept"), ci + 1, out->n - before);
+    G_free(sel);
+    G_free(stats);
+}
+
 /* Process one crop (_process_crop + _process_batch). */
 static void process_crop(struct sam_model *m, const struct sam_image *img,
                          const struct crop *c, int ci,
                          const struct amg_params *p, float *encbuf,
                          struct mask_list *out)
 {
-    const int W = img->cols, H = img->rows;
     const int w = c->x1 - c->x0, h = c->y1 - c->y0;
     int n_side =
         (int)(p->points_per_side / pow(p->crop_points_downscale, c->layer));
@@ -490,46 +601,16 @@ static void process_crop(struct sam_model *m, const struct sam_image *img,
                 sel[nsel++] = i;
         if (!nsel)
             continue;
-        sam_postprocess(m, nsel, sel, h, w, (float)p->stability_offset, stats);
+        sam_postprocess(m, nsel, sel, h, w, (float)p->stability_offset, 1,
+                        stats);
 
         for (k = 0; k < nsel; k++) {
             const int *st = stats + 6 * k;
             double stab = st[1] > 0 ? (double)st[0] / st[1] : 0.0;
-            struct sam_mask mk;
-            double bx[4], cb[4], ob[4] = {0, 0, W, H};
-            int e, near = 0;
 
             if (p->stability_thresh > 0.0 && !(stab >= p->stability_thresh))
                 continue;
-            if (st[4] < 0)
-                continue; /* Empty mask. */
-
-            mk.x0 = c->x0 + st[2];
-            mk.y0 = c->y0 + st[3];
-            mk.x1 = c->x0 + st[4];
-            mk.y1 = c->y0 + st[5];
-            bx[0] = mk.x0;
-            bx[1] = mk.y0;
-            bx[2] = mk.x1;
-            bx[3] = mk.y1;
-            cb[0] = c->x0;
-            cb[1] = c->y0;
-            cb[2] = c->x1;
-            cb[3] = c->y1;
-            for (e = 0; e < 4; e++)
-                if (fabs(bx[e] - cb[e]) <= EDGE_ATOL &&
-                    !(fabs(bx[e] - ob[e]) <= EDGE_ATOL))
-                    near = 1;
-            if (near)
-                continue;
-
-            mk.m = G_malloc((size_t)(st[4] - st[2] + 1) * (st[5] - st[3] + 1));
-            sam_read_mask(m, k, h, w, st[2], st[3], st[4], st[5], mk.m);
-            mk.iou = iou[sel[k]];
-            mk.stability = (float)stab;
-            mk.crop_score = 1.0 / ((double)w * h);
-            mk.area = 0;
-            list_push(&cl, &mk);
+            accept_mask(m, img, c, k, st, iou[sel[k]], -1, &cl);
         }
     }
     G_percent(1, 1, 1);
@@ -583,7 +664,10 @@ void amg_generate(struct sam_model *m, const struct sam_image *img,
     for (i = 0; i < ncrops; i++) {
         G_message(_("Segmenting crop %d of %d (%d x %d cells)..."), i + 1,
                   ncrops, crops[i].x1 - crops[i].x0, crops[i].y1 - crops[i].y0);
-        process_crop(m, img, &crops[i], i, p, encbuf, out);
+        if (p->nprompts > 0)
+            text_crop(m, img, &crops[i], i, p, encbuf, out);
+        else
+            process_crop(m, img, &crops[i], i, p, encbuf, out);
     }
     G_free(encbuf);
 

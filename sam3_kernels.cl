@@ -718,3 +718,87 @@ mask_post(__global const float *lowres, __global const int *sel,
         }
     }
 }
+
+/* In-place softmax of attention score rows (row = head * Nq + query,
+ * heads from h0), one work-group (64 or 256 items) per row of L keys,
+ * with optional terms added first: a causal mask (key j > query i is
+ * excluded), and SAM 3's box relative position bias, dy[(i * (L / W) +
+ * y) * nh + h] + dx[(i * W + x) * nh + h] for key j = y * W + x. */
+__kernel void softmax_ext(__global float *S, const int L, const int Nq,
+                          const int h0, const int causal,
+                          __global const float *dy, __global const float *dx,
+                          const int W, const int nh)
+{
+    __local float scratch[256];
+    const int lid = get_local_id(0), n = get_local_size(0);
+    const int row = get_group_id(0), i = row % Nq, h = h0 + row / Nq;
+    const int H = W > 0 ? L / W : 0;
+    __global float *s = S + (long)row * L;
+    float m = -INFINITY, sum = 0.0f, v;
+    int j;
+
+    for (j = lid; j < L; j += n) {
+        v = s[j];
+        if (causal && j > i)
+            v = -INFINITY;
+        else if (dy)
+            v += dy[(i * H + j / W) * nh + h] + dx[(i * W + j % W) * nh + h];
+        s[j] = v;
+        m = fmax(m, v);
+    }
+    m = wg_max(m, scratch, n);
+    for (j = lid; j < L; j += n) {
+        v = exp(s[j] - m);
+        s[j] = v;
+        sum += v;
+    }
+    v = 1.0f / wg_sum(sum, scratch, n);
+    for (j = lid; j < L; j += n)
+        s[j] *= v;
+}
+
+/* GroupNorm (G groups of C / G channels, statistics over all HW
+ * positions of a group) followed by ReLU, in place on a token-major
+ * HW x C map: one 256-item work-group per group. */
+__kernel __attribute__((reqd_work_group_size(256, 1, 1))) void
+groupnorm_relu(__global float *X, const int HW, const int C,
+               __global const float *g, __global const float *b,
+               const float eps)
+{
+    __local float scratch[256];
+    const int lid = get_local_id(0), grp = get_group_id(0);
+    const int cg = C / get_num_groups(0), c0 = grp * cg, total = HW * cg;
+    float s = 0.0f, mean, inv;
+    int i;
+
+    for (i = lid; i < total; i += 256)
+        s += X[(i / cg) * C + c0 + i % cg];
+    mean = wg_sum(s, scratch, 256) / total;
+    s = 0.0f;
+    for (i = lid; i < total; i += 256) {
+        const float d = X[(i / cg) * C + c0 + i % cg] - mean;
+
+        s += d * d;
+    }
+    inv = rsqrt(wg_sum(s, scratch, 256) / total + eps);
+    for (i = lid; i < total; i += 256) {
+        const int c = c0 + i % cg;
+        __global float *x = X + (i / cg) * C + c;
+
+        *x = fmax((*x - mean) * inv * g[c] + b[c], 0.0f);
+    }
+}
+
+/* out (H x W x C) = A + nearest 2x upsampling of Lo (H/2 x W/2 x C). */
+__kernel void up2_add(__global float *out, __global const float *A,
+                      __global const float *Lo, const int W, const int C,
+                      const int total)
+{
+    const int gid = get_global_id(0);
+    const int c = gid % C, t = gid / C;
+    const int y = t / W, x = t % W;
+
+    if (gid >= total)
+        return;
+    out[gid] = A[gid] + Lo[((y / 2) * (W / 2) + x / 2) * C + c];
+}

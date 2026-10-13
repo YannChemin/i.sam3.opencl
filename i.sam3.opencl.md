@@ -2,19 +2,23 @@
 
 *i.sam3.opencl* segments a 3-band imagery group with the Segment
 Anything Model 3 (SAM 3) and writes the segments as a clean vector area
-map. It runs SAM 3's point-prompt segmentation, its Perception Encoder
-image backbone, the neck of its point-prompt head, the prompt encoder and
-the mask decoder, on an OpenCL device (GPU or CPU), with weights read
+map. The network runs on an OpenCL device (GPU or CPU), with weights read
 directly from the original PyTorch checkpoint file: neither Python nor
 PyTorch is needed at run time.
 
-The module implements automatic mask generation with that point-prompt
-head: the model is prompted with a regular grid of points, and the masks
-it returns are kept according to their predicted quality and stability,
-de-duplicated and cleaned. The overlapping masks are then turned into a
+The module works in one of two ways:
+
+- **Automatic segmentation** (no **prompt**): SAM 3's point-prompt head
+  is prompted with a regular grid of points, and the masks it returns
+  are kept according to their predicted quality and stability,
+  de-duplicated and cleaned. Everything visible is segmented.
+- **Text prompts** (**prompt**): SAM 3's concept detector finds every
+  instance of each short noun phrase given, such as *building* or
+  *swimming pool*, and only those become segments.
+
+In both cases the overlapping masks are then turned into a
 non-overlapping, topologically clean vector map with one attribute row
-per segment. SAM 3's text-prompted concept detection and its video
-tracker are not used.
+per segment. SAM 3's video tracker is not used.
 
 The **group** (or its **subgroup**) must contain exactly three raster
 maps, which are used as the red, green and blue channels in the order
@@ -42,6 +46,28 @@ resumes where an interrupted one stopped, and waits for another run
 downloading the same file. The **-n** flag forbids downloading: a missing
 checkpoint is then an error. Checkpoints of SAM and SAM 2 are refused:
 they belong to *i.sam.opencl* and *i.sam2.opencl*.
+
+### Text prompts
+
+Each **prompt** is a short English noun phrase in plain ASCII text
+(several are given comma-separated). SAM 3 encodes it with its text
+encoder, fuses it with the image features, and its detector proposes 200
+candidate objects per crop. A candidate is kept when its score, the
+model's probability that it matches the prompt multiplied by the
+probability that the concept is present in the crop at all, exceeds
+**threshold** (0.5 by default, as in SAM 3's own `Sam3Processor`); its
+mask is the detector's segmentation. Crops are processed as in automatic
+segmentation (**tile_size**, **tile_overlap**, **crop_layers**), masks
+cut by an inner crop edge are discarded, and duplicates found in
+overlapping crops are removed (box IoU above 0.7), separately for each
+prompt. The options of the point-grid generator (**points_per_side**,
+**iou_threshold**, **stability_threshold**, **nms_threshold**) are not
+used.
+
+Prompts are matched as SAM 3 was trained: on short, concrete noun
+phrases. A segment belongs to the prompt that found it (the **prompt**
+column); where masks of different prompts overlap, the **overlap** rule
+decides, with *score* using the detection score.
 
 ### Mask generation
 
@@ -108,6 +134,10 @@ raster before simplification.
 | cells         | Segment size in cells                              |
 | area          | Area of the simplified polygon in square map units |
 
+With text prompts, the table holds the columns **cat**, **mask**,
+**prompt** (the text prompt that found the segment), **score** (its
+detection score), **cells** and **area**.
+
 A mask split into several pieces by overlapping masks yields several
 segments with the same **mask** number.
 
@@ -157,13 +187,23 @@ upsampled to 1008 pixels), which finds smaller objects at the cost of
 more crops. Square tiles avoid distorting objects: a crop much longer
 than wide is squashed to a square.
 
+### Text encoder and tokenizer
+
+The text encoder (1.2 GiB of weights) is loaded, run once for all the
+prompts and released before the image is processed. Its tokenizer is a C
+port of CLIP's byte-pair encoder, reading the vocabulary file installed
+with the module (`bpe_simple_vocab_16e6.txt.gz`, from OpenAI CLIP, MIT
+licence); prompts must be plain ASCII.
+
 ### Debugging aids
 
 When the environment variable `I_SAM3_OPENCL_DUMP` names a directory,
 the 8-bit crops, the encoder inputs, the image embeddings, the
-high-resolution features and the list of masks are written there. The
-script `tests/reference_compare.py` in the source tree compares them
-with the PyTorch reference implementation.
+high-resolution features (with text prompts: the detector features and
+the first prompt's text features) and the list of masks are written
+there. The scripts `tests/reference_compare.py` and
+`tests/reference_compare_text.py` in the source tree compare them with
+the PyTorch reference implementation.
 `I_SAM3_OPENCL_PROFILE=1` prints the time spent in each OpenCL kernel.
 `I_SAM3_OPENCL_DOWNLOAD_URL` replaces the download location
 (`https://huggingface.co/facebook/sam3/resolve/main`), for a local
@@ -182,6 +222,19 @@ g.region raster=lsat7_2002_30 -p
 i.group group=lsat_rgb input=lsat7_2002_30,lsat7_2002_20,lsat7_2002_10
 i.sam3.opencl group=lsat_rgb output=lsat_segments maxsize=50000
 v.db.select lsat_segments | head
+```
+
+### Text prompts
+
+Find the buildings and the swimming pools of an orthophoto, keeping
+detections with a score of at least 0.6:
+
+```sh
+i.group group=ortho_rgb input=ortho.red,ortho.green,ortho.blue
+g.region raster=ortho.red -p
+i.sam3.opencl group=ortho_rgb output=found \
+    prompt="building,swimming pool" threshold=0.6
+v.db.select found columns=cat,prompt,score,area | head
 ```
 
 ### Agricultural parcels

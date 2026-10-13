@@ -40,6 +40,7 @@ struct neck_level {
 
 struct sam_model {
     struct ocl_backend *ocl;
+    int point_head; /* Point-prompt head loaded (else text detection). */
     int embed, depth, heads, hd, mlp, pt_side;
 
     /* ViT backbone: patch embedding (no bias), tiled absolute position
@@ -101,15 +102,19 @@ struct sam_model {
  * point-prompt (tracker) heads. */
 int sam_is_sam3(const struct pth_file *pf);
 
-/* Load the SAM 3 Perception Encoder backbone, the neck of its
- * point-prompt head and that head's prompt encoder and mask decoder
- * onto the device, and allocate work buffers for decoding batch
- * prompts at a time. */
+/* Load the SAM 3 Perception Encoder backbone onto the device and, with
+ * point_head, the neck of its point-prompt head and that head's prompt
+ * encoder and mask decoder, and allocate work buffers for decoding batch
+ * prompts (3 * batch masks) at a time. */
 void sam_load(struct sam_model *m, struct ocl_backend *ocl,
-              const struct pth_file *pf, int batch);
+              const struct pth_file *pf, int batch, int point_head);
+
+/* Run the ViT backbone on a normalized 3 x 1008 x 1008 CHW image,
+ * leaving its 72 x 72 x 1024 output in m->x. */
+void sam_encode_trunk(struct sam_model *m, const float *img);
 
 /* Encode a normalized 3 x 1008 x 1008 CHW image and prepare the
- * prompt-independent decoder caches. */
+ * prompt-independent decoder caches of the point-prompt head. */
 void sam_encode(struct sam_model *m, const float *img);
 
 /* Copy the encoder outputs to host, token-major: the 72 x 72 x 256
@@ -123,14 +128,14 @@ void sam_read_features(struct sam_model *m, float *emb, float *s0, float *s1);
  * logits on the device. */
 void sam_decode(struct sam_model *m, int P, const float *points, float *iou);
 
-/* Postprocess n selected low-resolution masks (index p * 3 + k) to an
- * out_h x out_w crop: holes of at most SAM_HOLE pixels are filled in the
- * low-resolution logits, as SAM3InteractiveImagePredictor does, before
- * the bilinear resize. stats receives 6 ints per mask: count(logit >
- * offset), count(logit > -offset), xmin, ymin, xmax, ymax (xmax < 0 if
- * empty). */
+/* Postprocess n selected low-resolution masks (planes sel[] of the
+ * low-resolution logits) to an out_h x out_w crop: with fill, holes of
+ * at most SAM_HOLE pixels are filled in the low-resolution logits, as
+ * SAM3InteractiveImagePredictor does, before the bilinear resize. stats
+ * receives 6 ints per mask: count(logit > offset), count(logit > -offset),
+ * xmin, ymin, xmax, ymax (xmax < 0 if empty). */
 void sam_postprocess(struct sam_model *m, int n, const int *sel, int out_h,
-                     int out_w, float offset, int *stats);
+                     int out_w, float offset, int fill, int *stats);
 
 /* Read rows y0..y1 and columns x0..x1 (inclusive) of postprocessed mask
  * k into dst (row-major, (x1 - x0 + 1) wide). */

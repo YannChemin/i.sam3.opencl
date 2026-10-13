@@ -54,6 +54,11 @@ float *pth_read_f32(const struct pth_file *pf, const struct pth_tensor *t);
  * 2 * numel float32 (real, imaginary pairs). */
 float *pth_read_c64(const struct pth_file *pf, const struct pth_tensor *t);
 
+/* Read row r of a C-contiguous float32 matrix into dst (shape[1]
+ * floats), without reading the rest of the tensor. */
+void pth_read_row_f32(const struct pth_file *pf, const struct pth_tensor *t,
+                      long r, float *dst);
+
 void pth_close(struct pth_file *pf);
 
 #endif /* I_SAM3_OPENCL_PTH_LOADER_H */

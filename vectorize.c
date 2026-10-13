@@ -687,7 +687,8 @@ static void write_label_raster(const char *name, const int *K, int rows,
 }
 
 static void write_attributes(struct Map_info *Map, const struct segment *seg,
-                             const struct mask_list *masks, double cellarea)
+                             const struct mask_list *masks, double cellarea,
+                             char **labels)
 {
     struct field_info *Fi;
     dbDriver *driver;
@@ -708,11 +709,18 @@ static void write_attributes(struct Map_info *Map, const struct segment *seg,
     db_set_error_handler_driver(driver);
 
     db_init_string(&sql);
-    snprintf(buf, sizeof(buf),
-             "create table %s (%s integer, mask integer, "
-             "predicted_iou double precision, stability double precision, "
-             "cells integer, area double precision)",
-             Fi->table, GV_KEY_COLUMN);
+    if (labels)
+        snprintf(buf, sizeof(buf),
+                 "create table %s (%s integer, mask integer, prompt "
+                 "varchar(255), score double precision, cells integer, area "
+                 "double precision)",
+                 Fi->table, GV_KEY_COLUMN);
+    else
+        snprintf(buf, sizeof(buf),
+                 "create table %s (%s integer, mask integer, "
+                 "predicted_iou double precision, stability double "
+                 "precision, cells integer, area double precision)",
+                 Fi->table, GV_KEY_COLUMN);
     db_set_string(&sql, buf);
     if (db_execute_immediate(driver, &sql) != DB_OK)
         G_fatal_error(_("Unable to create table: %s"), db_get_string(&sql));
@@ -734,12 +742,27 @@ static void write_attributes(struct Map_info *Map, const struct segment *seg,
             continue;
         area = Vect_get_centroid_area(Map, line);
         mk = &masks->v[seg[cat].mask - 1];
-        snprintf(buf, sizeof(buf),
-                 "insert into %s values (%d, %d, %.6f, %.6f, %ld, %.6f)",
-                 Fi->table, cat, seg[cat].mask, mk->iou, mk->stability,
-                 seg[cat].cells,
-                 area > 0 ? Vect_get_area_area(Map, area)
-                          : seg[cat].cells * cellarea);
+        if (labels) {
+            dbString esc;
+
+            db_init_string(&esc);
+            db_set_string(&esc, labels[mk->label]);
+            db_double_quote_string(&esc);
+            snprintf(buf, sizeof(buf),
+                     "insert into %s values (%d, %d, '%s', %.6f, %ld, %.6f)",
+                     Fi->table, cat, seg[cat].mask, db_get_string(&esc),
+                     mk->iou, seg[cat].cells,
+                     area > 0 ? Vect_get_area_area(Map, area)
+                              : seg[cat].cells * cellarea);
+            db_free_string(&esc);
+        }
+        else
+            snprintf(buf, sizeof(buf),
+                     "insert into %s values (%d, %d, %.6f, %.6f, %ld, %.6f)",
+                     Fi->table, cat, seg[cat].mask, mk->iou, mk->stability,
+                     seg[cat].cells,
+                     area > 0 ? Vect_get_area_area(Map, area)
+                              : seg[cat].cells * cellarea);
         db_set_string(&sql, buf);
         if (db_execute_immediate(driver, &sql) != DB_OK)
             G_fatal_error(_("Unable to insert new record: %s"),
@@ -864,7 +887,7 @@ void vectorize_masks(const struct mask_list *masks, const struct sam_image *img,
     Vect_build_partial(&Map, GV_BUILD_NONE);
     Vect_build(&Map);
 
-    write_attributes(&Map, seg, masks, cellarea);
+    write_attributes(&Map, seg, masks, cellarea, vp->labels);
     Vect_close(&Map);
 
     Vect_destroy_line_struct(Points);

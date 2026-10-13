@@ -220,6 +220,38 @@ def _tools_with_env(session, **env):
     return Tools(env={**session.env, **env})
 
 
+def test_prompt_must_be_ascii(session, tmp_path):
+    """Prompts needing Unicode cleaning are refused before any OpenCL
+    work."""
+    tools = Tools(session=session)
+    dummy = tmp_path / "sam3.pt"
+    dummy.write_bytes(b"not used")
+
+    with pytest.raises(ToolError, match=r"not\s+plain\s+ASCII"):
+        tools.i_sam3_opencl(
+            group="rgb", checkpoint=str(dummy), prompt="for\u00eat", output="out"
+        )
+
+
+def test_text_prompts(session, checkpoint, device_options):
+    """Text prompts produce segments labelled with the prompt that found
+    them, with a detection score above the threshold."""
+    tools = Tools(session=session)
+    tools.i_sam3_opencl(
+        group="rgb",
+        checkpoint=checkpoint,
+        output="found",
+        prompt="rectangle,square",
+        minsize=50,
+        **device_options,
+    )
+    records = tools.v_db_select(map="found", format="json").json["records"]
+    assert records, "no instance found"
+    for r in records:
+        assert r["prompt"] in {"rectangle", "square"}
+        assert 0.5 < r["score"] <= 1
+
+
 def test_default_weights_dir(session, tmp_path):
     """Without checkpoint or weights_dir, the central folder
     $SAM_MODELS_DIR/sam3 is searched."""

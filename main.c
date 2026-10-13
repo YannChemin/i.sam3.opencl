@@ -29,6 +29,7 @@
 #include "ocl_backend.h"
 #include "pth_loader.h"
 #include "sam3_model.h"
+#include "sam3_text.h"
 #include "vectorize.h"
 
 static double now(void)
@@ -139,11 +140,11 @@ static void dump_masks(const char *dir, const struct mask_list *l)
     fp = fopen(path, "w");
     if (!fp)
         G_fatal_error(_("Unable to write debug dump <%s>"), path);
-    fprintf(fp, "x0,y0,x1,y1,area,predicted_iou,stability\n");
+    fprintf(fp, "x0,y0,x1,y1,area,predicted_iou,stability,label\n");
     for (i = 0; i < l->n; i++)
-        fprintf(fp, "%d,%d,%d,%d,%ld,%.6f,%.6f\n", l->v[i].x0, l->v[i].y0,
+        fprintf(fp, "%d,%d,%d,%d,%ld,%.6f,%.6f,%d\n", l->v[i].x0, l->v[i].y0,
                 l->v[i].x1, l->v[i].y1, l->v[i].area, l->v[i].iou,
-                l->v[i].stability);
+                l->v[i].stability, l->v[i].label);
     fclose(fp);
 }
 
@@ -154,7 +155,8 @@ int main(int argc, char *argv[])
         struct Option *group, *subgroup, *checkpoint, *weights_dir, *output,
             *raster, *percentile, *points, *pred_iou, *stability, *stab_offset,
             *nms, *crop_layers, *crop_downscale, *minsize, *maxsize, *overlap,
-            *simplify, *tile_size, *tile_overlap, *batch, *device, *platform;
+            *simplify, *tile_size, *tile_overlap, *batch, *device, *platform,
+            *prompt, *threshold;
     } opt;
     struct Flag *offline;
     struct ocl_backend ocl;
@@ -228,6 +230,28 @@ int main(int argc, char *argv[])
         _("Percentiles of each band stretched to the 0-255 range fed to "
           "SAM 3");
     opt.percentile->guisection = _("Input");
+
+    opt.prompt = G_define_option();
+    opt.prompt->key = "prompt";
+    opt.prompt->type = TYPE_STRING;
+    opt.prompt->required = NO;
+    opt.prompt->multiple = YES;
+    opt.prompt->key_desc = "text";
+    opt.prompt->label = _("Text prompts: objects to search for");
+    opt.prompt->description =
+        _("Short English noun phrases (e.g. building,swimming pool); every "
+          "instance found is a segment. Without prompts the region is "
+          "segmented automatically from a grid of point prompts");
+    opt.prompt->guisection = _("Text prompts");
+
+    opt.threshold = G_define_option();
+    opt.threshold->key = "threshold";
+    opt.threshold->type = TYPE_DOUBLE;
+    opt.threshold->answer = "0.5";
+    opt.threshold->options = "0-1";
+    opt.threshold->description =
+        _("Minimum detection score of an instance found by a text prompt");
+    opt.threshold->guisection = _("Text prompts");
 
     opt.points = G_define_option();
     opt.points->key = "points_per_side";
@@ -429,6 +453,28 @@ int main(int argc, char *argv[])
              opt.group->answer, opt.subgroup->answer ? " subgroup=" : "",
              opt.subgroup->answer ? opt.subgroup->answer : "");
     vp.source = source;
+    vp.labels = NULL;
+    ap.text = NULL;
+    ap.nprompts = 0;
+    ap.text_thresh = atof(opt.threshold->answer);
+    if (opt.prompt->answers) {
+        int k;
+
+        for (k = 0; opt.prompt->answers[k]; k++) {
+            const unsigned char *c;
+
+            G_strip(opt.prompt->answers[k]);
+            if (!*opt.prompt->answers[k])
+                G_fatal_error(_("Empty text prompt in <%s>"), opt.prompt->key);
+            /* The tokenizer's Unicode cleaning (ftfy) is not ported. */
+            for (c = (const unsigned char *)opt.prompt->answers[k]; *c; c++)
+                if (*c >= 0x80)
+                    G_fatal_error(_("Text prompt <%s> is not plain ASCII"),
+                                  opt.prompt->answers[k]);
+        }
+        ap.nprompts = k;
+        vp.labels = opt.prompt->answers;
+    }
 
     /* Validate the cheap inputs (group, checkpoint index) before the
      * OpenCL device is initialized and the weights are uploaded. */
@@ -467,7 +513,9 @@ int main(int argc, char *argv[])
 
     t0 = now();
     ocl_init(&ocl, opt.device->answer, opt.platform->answer);
-    sam_load(&model, &ocl, &pf, atoi(opt.batch->answer));
+    sam_load(&model, &ocl, &pf, atoi(opt.batch->answer), ap.nprompts == 0);
+    if (ap.nprompts)
+        ap.text = text_load(&model, &pf, ap.nprompts, opt.prompt->answers);
     pth_close(&pf);
     t1 = now();
     G_message(_("Model ready in %.1f s"), t1 - t0);
@@ -478,6 +526,7 @@ int main(int argc, char *argv[])
     if (ap.dump_dir)
         dump_masks(ap.dump_dir, &masks);
 
+    text_free(ap.text);
     sam_free(&model);
     ocl_free(&ocl);
 

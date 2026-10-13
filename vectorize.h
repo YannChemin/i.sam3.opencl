@@ -21,6 +21,7 @@ struct vect_params {
     const char *vector_out;
     const char *raster_out; /* Optional label raster, may be NULL. */
     const char *source;     /* Input description for the history. */
+    char **labels;          /* Text prompts by mask label, or NULL. */
 };
 
 /* Turn the (overlapping) SAM masks into a clean, non-overlapping vector

@@ -23,10 +23,7 @@
 
 #include "pth_loader.h"
 #include "sam3_model.h"
-
-#define ACT_NONE 0
-#define ACT_GELU 1
-#define ACT_RELU 2
+#include "sam3_ops.h"
 
 #define ENC_EPS 1e-5f  /* ViT LayerNorm(eps=1e-5). */
 #define DEC_EPS 1e-5f  /* nn.LayerNorm default, decoder transformer. */
@@ -50,8 +47,8 @@ int sam_is_sam3(const struct pth_file *pf)
 
 static size_t loaded_bytes;
 
-static cl_mem load_dev(struct sam_model *m, const struct pth_file *pf,
-                       const char *name, int ndim, const long *shape)
+cl_mem load_dev(struct sam_model *m, const struct pth_file *pf,
+                const char *name, int ndim, const long *shape)
 {
     const struct pth_tensor *t = pth_require(pf, name, ndim, shape);
     float *h = pth_read_f32(pf, t);
@@ -63,14 +60,14 @@ static cl_mem load_dev(struct sam_model *m, const struct pth_file *pf,
     return b;
 }
 
-static float *load_host(const struct pth_file *pf, const char *name, int ndim,
-                        const long *shape)
+float *load_host(const struct pth_file *pf, const char *name, int ndim,
+                 const long *shape)
 {
     return pth_read_f32(pf, pth_require(pf, name, ndim, shape));
 }
 
-static void load_host_into(const struct pth_file *pf, const char *name,
-                           int ndim, const long *shape, float *dst)
+void load_host_into(const struct pth_file *pf, const char *name, int ndim,
+                    const long *shape, float *dst)
 {
     const struct pth_tensor *t = pth_require(pf, name, ndim, shape);
     float *h = pth_read_f32(pf, t);
@@ -79,8 +76,8 @@ static void load_host_into(const struct pth_file *pf, const char *name,
     G_free(h);
 }
 
-static cl_mem load_dev_fmt(struct sam_model *m, const struct pth_file *pf,
-                           int ndim, const long *shape, const char *fmt, ...)
+cl_mem load_dev_fmt(struct sam_model *m, const struct pth_file *pf, int ndim,
+                    const long *shape, const char *fmt, ...)
 {
     char name[256];
     va_list ap;
@@ -122,8 +119,6 @@ static void release_attn(struct sam_attn_w *a)
 
 /* Kernel launch helpers. */
 
-#define SETARG(k, i, v) ocl_check(clSetKernelArg(k, i, sizeof(v), &(v)), #k)
-
 /* Accumulated kernel times when profiling is enabled. */
 static struct {
     const char *what;
@@ -132,8 +127,8 @@ static struct {
 } prof[64];
 static int nprof;
 
-static void run(struct sam_model *m, cl_kernel k, int dim, const size_t *g,
-                const size_t *l, const char *what)
+void run(struct sam_model *m, cl_kernel k, int dim, const size_t *g,
+         const size_t *l, const char *what)
 {
     cl_event ev;
     cl_ulong t0, t1;
@@ -160,39 +155,30 @@ static void run(struct sam_model *m, cl_kernel k, int dim, const size_t *g,
     }
 }
 
-static void run1d(struct sam_model *m, cl_kernel k, size_t n, const char *what)
+void run1d(struct sam_model *m, cl_kernel k, size_t n, const char *what)
 {
     size_t l = 256, g = (n + l - 1) / l * l;
 
     run(m, k, 1, &g, &l, what);
 }
 
-/* One GEMM operand: buffer, element offset, leading dimension and the
- * two batch strides. */
-struct opnd {
-    cl_mem buf;
-    cl_long off;
-    cl_int ld;
-    cl_long s0, s1;
-};
-
-static struct opnd mat(cl_mem buf, long off, int ld)
+struct opnd mat(cl_mem buf, long off, int ld)
 {
     struct opnd o = {buf, off, ld, 0, 0};
 
     return o;
 }
 
-static struct opnd bmat(cl_mem buf, long off, int ld, long s0, long s1)
+struct opnd bmat(cl_mem buf, long off, int ld, long s0, long s1)
 {
     struct opnd o = {buf, off, ld, s0, s1};
 
     return o;
 }
 
-static void gemm(struct sam_model *m, int M, int N, int K, struct opnd A,
-                 struct opnd B, int transb, struct opnd C, int nb, int nb1,
-                 cl_mem bias, cl_mem R, long roff, float alpha, int act)
+void gemm(struct sam_model *m, int M, int N, int K, struct opnd A,
+          struct opnd B, int transb, struct opnd C, int nb, int nb1,
+          cl_mem bias, cl_mem R, long roff, float alpha, int act)
 {
     cl_int cM = M, cN = N, cK = K, ct = transb, cnb1 = nb1, cact = act;
     cl_long croff = roff;
@@ -238,9 +224,8 @@ static void gemm(struct sam_model *m, int M, int N, int K, struct opnd A,
 }
 
 /* Y[rows, out] = act(X[rows, in] W^T + b) (+ Y when residual). */
-static void linear(struct sam_model *m, int rows, int in, int out, cl_mem X,
-                   long xoff, cl_mem W, cl_mem b, cl_mem Y, long yoff, int act,
-                   int residual)
+void linear(struct sam_model *m, int rows, int in, int out, cl_mem X, long xoff,
+            cl_mem W, cl_mem b, cl_mem Y, long yoff, int act, int residual)
 {
     gemm(m, rows, out, in, mat(X, xoff, in), mat(W, 0, in), 1,
          mat(Y, yoff, out), 1, 1, b, residual ? Y : NULL, yoff, 1.0f, act);
@@ -248,8 +233,8 @@ static void linear(struct sam_model *m, int rows, int in, int out, cl_mem X,
 
 /* Row LayerNorm: 256 items per row for wide rows, one 64-item wavefront
  * per row for the narrow ones. */
-static void layernorm(struct sam_model *m, long rows, int C, cl_mem X, cl_mem Y,
-                      cl_mem g, cl_mem b, float eps, int act)
+void layernorm(struct sam_model *m, long rows, int C, cl_mem X, cl_mem Y,
+               cl_mem g, cl_mem b, float eps, int act)
 {
     cl_kernel k = m->k_ln;
     cl_int cC = C, cact = act;
@@ -277,8 +262,8 @@ static void softmax_rows(struct sam_model *m, cl_mem S, long rows, int L)
     run(m, k, 1, &gs, &ls, "softmax_rows");
 }
 
-static void add_bcast(struct sam_model *m, cl_mem out, cl_mem a, cl_mem b,
-                      long n, long bmod)
+void add_bcast(struct sam_model *m, cl_mem out, cl_mem a, cl_mem b, long n,
+               long bmod)
 {
     cl_kernel k = m->k_add;
     cl_int cn = (cl_int)n, cb = (cl_int)bmod;
@@ -328,9 +313,8 @@ static void window_unpartition_add(struct sam_model *m, cl_mem X, cl_mem Wd,
     run1d(m, k, (size_t)H * H * C, "window_unpartition_add");
 }
 
-static void convt_scatter(struct sam_model *m, cl_mem G, cl_mem out,
-                          cl_mem bias, cl_mem add, int P, int H, int W, int Co,
-                          int act)
+void convt_scatter(struct sam_model *m, cl_mem G, cl_mem out, cl_mem bias,
+                   cl_mem add, int P, int H, int W, int Co, int act)
 {
     cl_kernel k = m->k_convt;
     cl_int cH = H, cW = W, cCo = Co, cact = act;
@@ -518,41 +502,70 @@ static void load_encoder(struct sam_model *m, const struct pth_file *pf)
     if (rope_win < 0 || rope_glob < 0)
         G_fatal_error(_("<%s> lacks windowed or global attention blocks"),
                       pf->path);
+}
 
-    /* Neck of the point-prompt head (sam2_convs); the fourth, 0.5x level
-     * is dropped by the backbone (scalp = 1). */
+/* The first three levels of a neck (prefix: its "convs" module); the
+ * fourth, 0.5x level is dropped by the backbone (scalp = 1). */
+void load_neck(struct sam_model *m, const struct pth_file *pf,
+               const char *prefix, struct neck_level lv[3])
+{
+    const long E = m->embed;
+    int i;
+
     for (i = 0; i < 3; i++) {
-        struct neck_level *n = &m->neck[i];
+        struct neck_level *n = &lv[i];
         long cin = E;
 
         n->scale = 4 >> i;
         if (n->scale == 4) {
             n->d0w = load_dev_fmt(m, pf, 4, (long[]){E, E / 2, 2, 2},
-                                  NECK ".%d.dconv_2x2_0.weight", i);
+                                  "%s.%d.dconv_2x2_0.weight", prefix, i);
             n->d0b = load_dev_fmt(m, pf, 1, (long[]){E / 2},
-                                  NECK ".%d.dconv_2x2_0.bias", i);
+                                  "%s.%d.dconv_2x2_0.bias", prefix, i);
             n->d1w = load_dev_fmt(m, pf, 4, (long[]){E / 2, E / 4, 2, 2},
-                                  NECK ".%d.dconv_2x2_1.weight", i);
+                                  "%s.%d.dconv_2x2_1.weight", prefix, i);
             n->d1b = load_dev_fmt(m, pf, 1, (long[]){E / 4},
-                                  NECK ".%d.dconv_2x2_1.bias", i);
+                                  "%s.%d.dconv_2x2_1.bias", prefix, i);
             cin = E / 4;
         }
         else if (n->scale == 2) {
             n->d0w = load_dev_fmt(m, pf, 4, (long[]){E, E / 2, 2, 2},
-                                  NECK ".%d.dconv_2x2.weight", i);
+                                  "%s.%d.dconv_2x2.weight", prefix, i);
             n->d0b = load_dev_fmt(m, pf, 1, (long[]){E / 2},
-                                  NECK ".%d.dconv_2x2.bias", i);
+                                  "%s.%d.dconv_2x2.bias", prefix, i);
             cin = E / 2;
         }
         n->c1w = load_dev_fmt(m, pf, 4, (long[]){SAM_DIM, cin, 1, 1},
-                              NECK ".%d.conv_1x1.weight", i);
+                              "%s.%d.conv_1x1.weight", prefix, i);
         n->c1b = load_dev_fmt(m, pf, 1, (long[]){SAM_DIM},
-                              NECK ".%d.conv_1x1.bias", i);
+                              "%s.%d.conv_1x1.bias", prefix, i);
         n->c3w = load_dev_fmt(m, pf, 4, (long[]){SAM_DIM, SAM_DIM, 3, 3},
-                              NECK ".%d.conv_3x3.weight", i);
+                              "%s.%d.conv_3x3.weight", prefix, i);
         n->c3b = load_dev_fmt(m, pf, 1, (long[]){SAM_DIM},
-                              NECK ".%d.conv_3x3.bias", i);
+                              "%s.%d.conv_3x3.bias", prefix, i);
     }
+}
+
+void release_neck(struct neck_level lv[3])
+{
+    int j;
+    size_t i;
+
+    for (j = 0; j < 3; j++) {
+        struct neck_level *n = &lv[j];
+        cl_mem *nb[] = {&n->d0w, &n->d0b, &n->d1w, &n->d1b,
+                        &n->c1w, &n->c1b, &n->c3w, &n->c3b};
+
+        for (i = 0; i < sizeof(nb) / sizeof(nb[0]); i++)
+            ocl_release(nb[i]);
+    }
+}
+
+/* The neck of the point-prompt head (sam2_convs) and its decoder's
+ * high-resolution projections. */
+static void load_point_neck(struct sam_model *m, const struct pth_file *pf)
+{
+    load_neck(m, pf, NECK, m->neck);
     m->s0w = load_dev(m, pf, "tracker.sam_mask_decoder.conv_s0.weight", 4,
                       (long[]){SAM_DIM / 8, SAM_DIM, 1, 1});
     m->s0b = load_dev(m, pf, "tracker.sam_mask_decoder.conv_s0.bias", 1,
@@ -773,6 +786,17 @@ static void alloc_buffers(struct sam_model *m)
     m->nka = walloc(ocl, nneck * f, "neck a");
     m->nkb = walloc(ocl, nneck * f, "neck b");
     m->col = walloc(ocl, m->col_rows * 9 * SAM_DIM * f, "neck im2col");
+    m->lowres =
+        walloc(ocl, P * 3 * SAM_LOWRES * SAM_LOWRES * f, "low-res masks");
+    m->h_lowres = G_malloc(P * 3 * SAM_LOWRES * SAM_LOWRES * f);
+    m->sel = walloc(ocl, P * 3 * sizeof(cl_int), "mask selection");
+    m->stats = walloc(ocl, P * 3 * 6 * sizeof(cl_int), "mask statistics");
+    if (!m->point_head) {
+        G_verbose_message(_("Allocated %lu MiB of work buffers"),
+                          (unsigned long)(work_bytes >> 20));
+        return;
+    }
+
     m->emb = walloc(ocl, T * SAM_DIM * f, "embedding");
     m->feat_s0 = walloc(ocl, T4 * (SAM_DIM / 8) * f, "features s0");
     m->feat_s1 = walloc(ocl, 4 * T * (SAM_DIM / 4) * f, "features s1");
@@ -810,22 +834,18 @@ static void alloc_buffers(struct sam_model *m)
     m->g2 = walloc(ocl, P * 4 * T * 128 * f, "upscaling 2 gemm");
     m->u2 = walloc(ocl, P * 16 * T * 32 * f, "upscaling 2");
     m->hyper = walloc(ocl, P * 3 * 32 * f, "hypernetwork");
-    m->lowres =
-        walloc(ocl, P * 3 * SAM_LOWRES * SAM_LOWRES * f, "low-res masks");
     m->h_queries = G_malloc(P * NTOK * SAM_DIM * f);
-    m->h_lowres = G_malloc(P * 3 * SAM_LOWRES * SAM_LOWRES * f);
-    m->sel = walloc(ocl, P * 3 * sizeof(cl_int), "mask selection");
-    m->stats = walloc(ocl, P * 3 * 6 * sizeof(cl_int), "mask statistics");
     G_verbose_message(_("Allocated %lu MiB of work buffers"),
                       (unsigned long)(work_bytes >> 20));
 }
 
 void sam_load(struct sam_model *m, struct ocl_backend *ocl,
-              const struct pth_file *pf, int batch)
+              const struct pth_file *pf, int batch, int point_head)
 {
     memset(m, 0, sizeof(*m));
     m->ocl = ocl;
     m->batch = batch;
+    m->point_head = point_head;
 
     m->k_gemm = ocl_kernel(ocl, "gemm");
     m->k_gemm_big = ocl_kernel(ocl, "gemm_big");
@@ -846,7 +866,10 @@ void sam_load(struct sam_model *m, struct ocl_backend *ocl,
     G_message(_("Loading SAM 3 checkpoint <%s>..."), pf->path);
     loaded_bytes = 0;
     load_encoder(m, pf);
-    load_decoder(m, pf);
+    if (point_head) {
+        load_point_neck(m, pf);
+        load_decoder(m, pf);
+    }
     G_verbose_message(_("Uploaded %lu MiB of weights"),
                       (unsigned long)(loaded_bytes >> 20));
 
@@ -922,8 +945,8 @@ static void vit_block(struct sam_model *m, const struct vit_block *b)
 
 /* 3x3/pad-1 convolution of a side x side x SAM_DIM map X into Y, in bands
  * of col_rows tokens. */
-static void conv3x3(struct sam_model *m, cl_mem X, int side, cl_mem w, cl_mem b,
-                    cl_mem Y)
+void conv3x3(struct sam_model *m, cl_mem X, int side, cl_mem w, cl_mem b,
+             cl_mem Y)
 {
     const long T = (long)side * side;
     cl_kernel k = m->k_im2col;
@@ -950,49 +973,59 @@ static void conv3x3(struct sam_model *m, cl_mem X, int side, cl_mem w, cl_mem b,
 /* 2x2/stride-2 transposed convolution of a side x side x cin map X
  * (weight [cin, cout, 2, 2]) into a 2 side x 2 side x cout map Y, through
  * the GEMM buffer G. */
-static void convt2x2(struct sam_model *m, cl_mem X, int side, int cin, int cout,
-                     cl_mem w, cl_mem b, cl_mem G, cl_mem Y, int act)
+void convt2x2(struct sam_model *m, cl_mem X, int side, int cin, int cout,
+              cl_mem w, cl_mem b, cl_mem G, cl_mem Y, int act)
 {
     gemm(m, side * side, cout * 4, cin, mat(X, 0, cin), mat(w, 0, cout * 4), 0,
          mat(G, 0, cout * 4), 1, 1, NULL, NULL, 0, 1.0f, ACT_NONE);
     convt_scatter(m, G, Y, b, NULL, 1, side, side, cout, act);
 }
 
-/* Neck of the point-prompt head (a SimpleFPN on the last ViT map) and
- * the decoder's high-resolution projections: level 0 at 4x (288 x 288)
- * feeds conv_s0, level 1 at 2x conv_s1, level 2 at 1x is the image
- * embedding, to which SAM3InteractiveImagePredictor adds no_mem_embed. */
-static void neck(struct sam_model *m)
+/* One level of a SimpleFPN neck on the last ViT map (in x) into out, a
+ * (4 >> i) * 72 square map of SAM_DIM channels; out may be nkb. */
+void neck_level(struct sam_model *m, const struct neck_level *n, cl_mem out)
 {
     const int G = SAM_GRID, E = m->embed;
-    const struct neck_level *n;
 
-    n = &m->neck[0];
-    convt2x2(m, m->x, G, E, E / 2, n->d0w, n->d0b, m->nka, m->nkb, ACT_GELU);
-    convt2x2(m, m->nkb, 2 * G, E / 2, E / 4, n->d1w, n->d1b, m->nka, m->nkb,
-             ACT_NONE);
-    linear(m, 16 * G * G, E / 4, SAM_DIM, m->nkb, 0, n->c1w, n->c1b, m->nka, 0,
-           ACT_NONE, 0);
-    conv3x3(m, m->nka, 4 * G, n->c3w, n->c3b, m->nkb);
+    if (n->scale == 4) {
+        convt2x2(m, m->x, G, E, E / 2, n->d0w, n->d0b, m->nka, m->nkb,
+                 ACT_GELU);
+        convt2x2(m, m->nkb, 2 * G, E / 2, E / 4, n->d1w, n->d1b, m->nka, m->nkb,
+                 ACT_NONE);
+        linear(m, 16 * G * G, E / 4, SAM_DIM, m->nkb, 0, n->c1w, n->c1b, m->nka,
+               0, ACT_NONE, 0);
+    }
+    else if (n->scale == 2) {
+        convt2x2(m, m->x, G, E, E / 2, n->d0w, n->d0b, m->nka, m->nkb,
+                 ACT_NONE);
+        linear(m, 4 * G * G, E / 2, SAM_DIM, m->nkb, 0, n->c1w, n->c1b, m->nka,
+               0, ACT_NONE, 0);
+    }
+    else
+        linear(m, G * G, E, SAM_DIM, m->x, 0, n->c1w, n->c1b, m->nka, 0,
+               ACT_NONE, 0);
+    conv3x3(m, m->nka, n->scale * G, n->c3w, n->c3b, out);
+}
+
+/* Neck of the point-prompt head and the decoder's high-resolution
+ * projections: level 0 at 4x (288 x 288) feeds conv_s0, level 1 at 2x
+ * conv_s1, level 2 at 1x is the image embedding, to which
+ * SAM3InteractiveImagePredictor adds no_mem_embed. */
+static void point_neck(struct sam_model *m)
+{
+    const int G = SAM_GRID;
+
+    neck_level(m, &m->neck[0], m->nkb);
     linear(m, 16 * G * G, SAM_DIM, SAM_DIM / 8, m->nkb, 0, m->s0w, m->s0b,
            m->feat_s0, 0, ACT_NONE, 0);
-
-    n = &m->neck[1];
-    convt2x2(m, m->x, G, E, E / 2, n->d0w, n->d0b, m->nka, m->nkb, ACT_NONE);
-    linear(m, 4 * G * G, E / 2, SAM_DIM, m->nkb, 0, n->c1w, n->c1b, m->nka, 0,
-           ACT_NONE, 0);
-    conv3x3(m, m->nka, 2 * G, n->c3w, n->c3b, m->nkb);
+    neck_level(m, &m->neck[1], m->nkb);
     linear(m, 4 * G * G, SAM_DIM, SAM_DIM / 4, m->nkb, 0, m->s1w, m->s1b,
            m->feat_s1, 0, ACT_NONE, 0);
-
-    n = &m->neck[2];
-    linear(m, G * G, E, SAM_DIM, m->x, 0, n->c1w, n->c1b, m->nka, 0, ACT_NONE,
-           0);
-    conv3x3(m, m->nka, G, n->c3w, n->c3b, m->emb);
+    neck_level(m, &m->neck[2], m->emb);
     add_bcast(m, m->emb, m->emb, m->no_mem, (long)G * G * SAM_DIM, SAM_DIM);
 }
 
-void sam_encode(struct sam_model *m, const float *img)
+void sam_encode_trunk(struct sam_model *m, const float *img)
 {
     const long T = SAM_GRID * SAM_GRID;
     const int E = m->embed, K = 3 * SAM_PATCHSZ * SAM_PATCHSZ;
@@ -1022,7 +1055,14 @@ void sam_encode(struct sam_model *m, const float *img)
         vit_block(m, &m->blocks[i]);
     }
     G_percent(1, 1, 1);
-    neck(m);
+}
+
+void sam_encode(struct sam_model *m, const float *img)
+{
+    const long T = SAM_GRID * SAM_GRID;
+
+    sam_encode_trunk(m, img);
+    point_neck(m);
 
     /* Prompt-independent decoder inputs. Without a mask prompt the
      * dense embedding is no_mask_embed broadcast over the grid. */
@@ -1056,8 +1096,8 @@ void sam_read_features(struct sam_model *m, float *emb, float *s0, float *s1)
 /* Mask decoder forward pass. */
 
 /* y = W x + b for a PyTorch [nout, nin] weight, optional ReLU. */
-static void host_linear(const float *W, const float *b, const float *x, int nin,
-                        int nout, int relu, float *y)
+void host_linear(const float *W, const float *b, const float *x, int nin,
+                 int nout, int relu, float *y)
 {
     int o, i;
 
@@ -1317,7 +1357,7 @@ static int fill_holes(float *v, int L, int max_area, int *lab, int *stack)
 }
 
 void sam_postprocess(struct sam_model *m, int n, const int *sel, int out_h,
-                     int out_w, float offset, int *stats)
+                     int out_w, float offset, int fill, int *stats)
 {
     const int L = SAM_LOWRES;
     const size_t plane = (size_t)L * L * sizeof(float);
@@ -1333,6 +1373,8 @@ void sam_postprocess(struct sam_model *m, int n, const int *sel, int out_h,
 
     /* Hole filling on the host, for the selected masks only. */
     changed = G_calloc(n, 1);
+    if (!fill)
+        goto resize;
     for (i = 0; i < n; i++)
         ocl_check(clEnqueueReadBuffer(
                       m->ocl->queue, m->lowres, CL_FALSE, sel[i] * plane, plane,
@@ -1355,8 +1397,8 @@ void sam_postprocess(struct sam_model *m, int n, const int *sel, int out_h,
         if (changed[i])
             ocl_write(m->ocl, m->lowres, sel[i] * plane,
                       m->h_lowres + (size_t)i * L * L, plane);
+resize:
     G_free(changed);
-
     if (need > m->mask_cap) {
         ocl_release(&m->mask);
         m->mask = ocl_alloc(m->ocl, need, "postprocessed masks");
@@ -1433,14 +1475,7 @@ void sam_free(struct sam_model *m)
 
     for (i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++)
         ocl_release(bufs[i]);
-    for (j = 0; j < 3; j++) {
-        struct neck_level *n = &m->neck[j];
-        cl_mem *nb[] = {&n->d0w, &n->d0b, &n->d1w, &n->d1b,
-                        &n->c1w, &n->c1b, &n->c3w, &n->c3b};
-
-        for (i = 0; i < sizeof(nb) / sizeof(nb[0]); i++)
-            ocl_release(nb[i]);
-    }
+    release_neck(m->neck);
     for (j = 0; j < m->depth; j++) {
         struct vit_block *b = &m->blocks[j];
         cl_mem *bb[] = {&b->n1w,   &b->n1b,   &b->qkvw, &b->qkvb,

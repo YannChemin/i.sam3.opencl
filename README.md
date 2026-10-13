@@ -10,8 +10,17 @@ nor PyTorch is needed at run time. See `i.sam3.opencl.md` for the full
 manual.
 
 This is the SAM 3 counterpart of *i.sam.opencl* (SAM) and *i.sam2.opencl*
-(SAM 2); the three modules are independent. SAM 3's text-prompted concept
-segmentation is not implemented yet.
+(SAM 2); the three modules are independent. Besides the automatic
+point-grid segmentation of the other two, it finds the instances of text
+prompts with SAM 3's concept detector:
+
+```sh
+i.sam3.opencl group=rgb output=found prompt="building,swimming pool"
+```
+
+The text tokenizer's vocabulary, `bpe_simple_vocab_16e6.txt.gz`, comes
+from OpenAI CLIP under the MIT licence (see `LICENSE.bpe`); it is
+installed with the module.
 
 ## SAM 3 weights
 

@@ -5,14 +5,16 @@
 
 #include "image.h"
 #include "sam3_model.h"
+#include "sam3_text.h"
 
 /* One accepted mask, stored as a byte map over its bounding box in
  * region cell coordinates (inclusive box). */
 struct sam_mask {
     int x0, y0, x1, y1;
     unsigned char *m;
-    float iou, stability;
-    double crop_score; /* 1 / crop area, for cross-crop NMS. */
+    float iou, stability; /* Text detection: score, stability. */
+    double crop_score;    /* 1 / crop area, for cross-crop NMS. */
+    int label;            /* Text prompt index, -1 for point prompts. */
     long area;
 };
 
@@ -37,6 +39,11 @@ struct amg_params {
     int tile_size;
     int tile_overlap;
     const char *dump_dir; /* Debug dumps of encoder input/embedding. */
+    /* Text prompts: with nprompts > 0, each crop is searched for the
+     * concepts instead of being prompted with a point grid. */
+    struct sam3_text *text;
+    int nprompts;
+    double text_thresh;
 };
 
 void amg_generate(struct sam_model *m, const struct sam_image *img,

@@ -1009,6 +1009,20 @@ float *pth_read_f32(const struct pth_file *pf, const struct pth_tensor *t)
     return out;
 }
 
+void pth_read_row_f32(const struct pth_file *pf, const struct pth_tensor *t,
+                      long r, float *dst)
+{
+    if (t->dtype != PTH_F32 || t->ndim != 2 || t->stride[1] != 1 ||
+        t->stride[0] != t->shape[1])
+        G_fatal_error(_("Tensor <%s> is not a contiguous float32 matrix"),
+                      t->name);
+    if (r < 0 || r >= t->shape[0])
+        G_fatal_error(_("Row %ld out of range in tensor <%s>"), r, t->name);
+    read_at(pf->fp,
+            t->data_offset + (off_t)(t->storage_offset + r * t->stride[0]) * 4,
+            dst, t->shape[1] * sizeof(float), pf->path);
+}
+
 void pth_close(struct pth_file *pf)
 {
     int i;
