@@ -17,6 +17,7 @@
 #include <grass/gis.h>
 #include <grass/glocale.h>
 
+#include "progress.h"
 #include "pth_loader.h"
 
 /* Zip archive handling. torch.save() writes stored (uncompressed)
@@ -56,6 +57,7 @@ static void read_at(FILE *fp, off_t off, void *buf, size_t n, const char *path)
     if (fseeko(fp, off, SEEK_SET) != 0 || fread(buf, 1, n, fp) != n)
         G_fatal_error(_("Unable to read %lu bytes at offset %lld in <%s>"),
                       (unsigned long)n, (long long)off, path);
+    progress_bytes(n);
 }
 
 static void zip_read_dir(FILE *fp, const char *path, struct zip_dir *zd)
@@ -1021,6 +1023,19 @@ void pth_read_row_f32(const struct pth_file *pf, const struct pth_tensor *t,
     read_at(pf->fp,
             t->data_offset + (off_t)(t->storage_offset + r * t->stride[0]) * 4,
             dst, t->shape[1] * sizeof(float), pf->path);
+}
+
+double pth_bytes(const struct pth_file *pf, const char *prefix)
+{
+    size_t len = strlen(prefix);
+    double sum = 0;
+    int i;
+
+    for (i = 0; i < pf->ntensors; i++)
+        if (strncmp(pf->tensors[i].name, prefix, len) == 0)
+            sum += (double)pth_numel(&pf->tensors[i]) *
+                   dtype_size(pf->tensors[i].dtype);
+    return sum;
 }
 
 void pth_close(struct pth_file *pf)

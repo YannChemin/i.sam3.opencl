@@ -32,6 +32,39 @@ from sam3.model_builder import build_sam3_image_model
 from torchvision.transforms import v2
 
 
+def cpu_only():
+    """Map sam3's hard-coded CUDA tensors to the CPU when there is no GPU.
+
+    Several sam3 constructors create buffers with device="cuda" whatever
+    the model device (PositionEmbeddingSine, TransformerDecoder, ...).
+    """
+    if torch.cuda.is_available():
+        return
+
+    def on_cpu(factory):
+        def wrapped(*args, **kwargs):
+            if str(kwargs.get("device", "")).startswith("cuda"):
+                kwargs["device"] = "cpu"
+            return factory(*args, **kwargs)
+
+        return wrapped
+
+    for name in (
+        "arange",
+        "empty",
+        "full",
+        "linspace",
+        "ones",
+        "rand",
+        "randn",
+        "tensor",
+        "zeros",
+    ):
+        setattr(torch, name, on_cpu(getattr(torch, name)))
+    # Pinned host memory needs an accelerator.
+    torch.Tensor.pin_memory = lambda self, *args, **kwargs: self
+
+
 def load_dump(dump_dir, name, shape):
     path = os.path.join(dump_dir, f"crop000_{name}.f32")
     return np.fromfile(path, np.float32).reshape(shape)
@@ -70,6 +103,7 @@ def main():
     txt = np.fromfile(os.path.join(args.dump_dir, "crop000_text.f32"), np.float32)
     txt = txt.reshape(-1, 256)
 
+    cpu_only()
     model = build_sam3_image_model(
         checkpoint_path=args.checkpoint, load_from_HF=False, device="cpu"
     )

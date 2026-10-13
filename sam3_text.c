@@ -415,7 +415,6 @@ static void encode_prompts(struct sam3_text *t, const struct pth_file *pf,
                      vsz = W * sizeof(float);
         float *w, *bb;
 
-        G_percent(l, L, 10);
         snprintf(name, sizeof(name), "%s.%d.attn.in_proj_weight", p, l);
         w = load_host(pf, name, 2, (long[]){3 * W, W});
         snprintf(name, sizeof(name), "%s.%d.attn.in_proj_bias", p, l);
@@ -445,7 +444,6 @@ static void encode_prompts(struct sam3_text *t, const struct pth_file *pf,
         b->pb =
             load_dev_fmt(m, pf, 1, (long[]){W}, "%s.%d.mlp.c_proj.bias", p, l);
     }
-    G_percent(1, 1, 1);
     lfw = load_dev(m, pf, TXT ".encoder.ln_final.weight", 1, (long[]){W});
     lfb = load_dev(m, pf, TXT ".encoder.ln_final.bias", 1, (long[]){W});
     rw = load_dev(m, pf, TXT ".resizer.weight", 2, (long[]){D, W});

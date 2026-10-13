@@ -21,6 +21,7 @@
 #include <grass/gis.h>
 #include <grass/glocale.h>
 
+#include "progress.h"
 #include "pth_loader.h"
 #include "sam3_model.h"
 #include "sam3_ops.h"
@@ -337,7 +338,7 @@ void convt_scatter(struct sam_model *m, cl_mem G, cl_mem out, cl_mem bias,
  * per-prompt strides sq/sk/sv (0 = shared by all prompts); the
  * recombined heads are written to o as P * Nq rows of dint. Scores,
  * softmax and weighting are fused: per query for the 8 prompt-token
- * keys, per work-group for the 4096 image-token keys. */
+ * keys, per work-group (online softmax) for the 5184 image-token keys. */
 static void mha(struct sam_model *m, int P, int Nq, int Nk, int dint, cl_mem qp,
                 long sq, cl_mem kp, long sk, cl_mem vp, long sv, cl_mem o)
 {
@@ -348,7 +349,7 @@ static void mha(struct sam_model *m, int P, int Nq, int Nk, int dint, cl_mem qp,
     int many = Nk > 64;
     cl_kernel k = many ? m->k_attn_many : m->k_attn_few;
 
-    if (many && (c != 16 || Nk > 4096))
+    if (many && c != 16)
         G_fatal_error("mha: unsupported shape");
     SETARG(k, 0, qp);
     SETARG(k, 1, csq);
@@ -449,7 +450,6 @@ static void load_encoder(struct sam_model *m, const struct pth_file *pf)
         const char *p = TRUNK ".blocks";
         long npos;
 
-        G_percent(i, m->depth, 5);
         /* The block's RoPE table covers its attention extent: a window
          * (squared window side) or the whole grid. */
         snprintf(name, sizeof(name), "%s.%d.attn.freqs_cis", p, i);
@@ -498,7 +498,6 @@ static void load_encoder(struct sam_model *m, const struct pth_file *pf)
         s1[0] = E;
         b->l2b = load_dev_fmt(m, pf, 1, s1, "%s.%d.mlp.fc2.bias", p, i);
     }
-    G_percent(1, 1, 1);
     if (rope_win < 0 || rope_glob < 0)
         G_fatal_error(_("<%s> lacks windowed or global attention blocks"),
                       pf->path);
@@ -1051,10 +1050,12 @@ void sam_encode_trunk(struct sam_model *m, const float *img)
     }
 
     for (i = 0; i < m->depth; i++) {
-        G_percent(i, m->depth, 10);
+        /* Report the blocks the device has finished, not the ones
+         * queued: enqueueing all of them takes milliseconds. */
+        clFinish(m->ocl->queue);
+        progress_part(i, m->depth);
         vit_block(m, &m->blocks[i]);
     }
-    G_percent(1, 1, 1);
 }
 
 void sam_encode(struct sam_model *m, const float *img)

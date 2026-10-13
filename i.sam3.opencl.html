@@ -1,0 +1,240 @@
+<h2>DESCRIPTION</h2>
+<p><em>i.sam3.opencl</em> segments a 3-band imagery group with the Segment
+Anything Model 3 (SAM 3) and writes the segments as a clean vector area
+map. The network runs on an OpenCL device (GPU or CPU), with weights read
+directly from the original PyTorch checkpoint file: neither Python nor
+PyTorch is needed at run time.</p>
+<p>The module works in one of two ways:</p>
+<ul>
+<li><b>Automatic segmentation</b> (no <b>prompt</b>): SAM 3's point-prompt head
+  is prompted with a regular grid of points, and the masks it returns
+  are kept according to their predicted quality and stability,
+  de-duplicated and cleaned. Everything visible is segmented.</li>
+<li><b>Text prompts</b> (<b>prompt</b>): SAM 3's concept detector finds every
+  instance of each short noun phrase given, such as <em>building</em> or
+  <em>swimming pool</em>, and only those become segments.</li>
+</ul>
+<p>In both cases the overlapping masks are then turned into a
+non-overlapping, topologically clean vector map with one attribute row
+per segment. SAM 3's video tracker is not used.</p>
+<p>The <b>group</b> (or its <b>subgroup</b>) must contain exactly three raster
+maps, which are used as the red, green and blue channels in the order
+they are listed in the group (see <em>i.group</em>). Each band is stretched
+linearly between its lower and upper <b>percentile</b> to the 0-255 range
+SAM 3 was trained on. Cells that are NULL in any band are not segmented.
+Processing is done in the current computational region.</p>
+<h3>Checkpoint</h3>
+<p>The <b>checkpoint</b> is the original <code>sam3.pt</code> (3.2 GiB) published by Meta
+on Hugging Face (<a href="https://huggingface.co/facebook/sam3">https://huggingface.co/facebook/sam3</a>). The model is
+gated: an account must request access there, and downloading needs that
+account's access token.</p>
+<p>Without a <b>checkpoint</b> file, the module looks for <code>sam3.pt</code> in the
+weights folder: <b>weights_dir</b>, by default the central folder
+<code>$SAM_MODELS_DIR/sam3</code>, or <code>~/models/sam/sam3</code> when the environment
+variable <code>SAM_MODELS_DIR</code> is not set. If it is not there, it is
+downloaded into that folder (created if needed) on first use and reused
+afterwards. The download uses the token in the environment variable
+<code>HF_TOKEN</code>, else the one saved by <code>hf auth login</code>
+(<code>~/.cache/huggingface/token</code>); it is checked against the published size,
+resumes where an interrupted one stopped, and waits for another run
+downloading the same file. The <b>-n</b> flag forbids downloading: a missing
+checkpoint is then an error. Checkpoints of SAM and SAM 2 are refused:
+they belong to <em>i.sam.opencl</em> and <em>i.sam2.opencl</em>.</p>
+<h3>Text prompts</h3>
+<p>Each <b>prompt</b> is a short English noun phrase in plain ASCII text
+(several are given comma-separated). SAM 3 encodes it with its text
+encoder, fuses it with the image features, and its detector proposes 200
+candidate objects per crop. A candidate is kept when its score, the
+model's probability that it matches the prompt multiplied by the
+probability that the concept is present in the crop at all, exceeds
+<b>threshold</b> (0.5 by default, as in SAM 3's own <code>Sam3Processor</code>); its
+mask is the detector's segmentation. Crops are processed as in automatic
+segmentation (<b>tile_size</b>, <b>tile_overlap</b>, <b>crop_layers</b>), masks
+cut by an inner crop edge are discarded, and duplicates found in
+overlapping crops are removed (box IoU above 0.7), separately for each
+prompt. The options of the point-grid generator (<b>points_per_side</b>,
+<b>iou_threshold</b>, <b>stability_threshold</b>, <b>nms_threshold</b>) are not
+used.</p>
+<p>Prompts are matched as SAM 3 was trained: on short, concrete noun
+phrases. A segment belongs to the prompt that found it (the <b>prompt</b>
+column); where masks of different prompts overlap, the <b>overlap</b> rule
+decides, with <em>score</em> using the detection score.</p>
+<h3>Mask generation</h3>
+<p>The region is processed in crops. A region no larger than <b>tile_size</b>
+cells is one crop, a larger region is split into tiles of <b>tile_size</b>
+cells overlapping by <b>tile_overlap</b> cells. With <b>crop_layers</b> greater
+than 0, each tile is additionally segmented in zoomed-in sub-crops (4 in
+layer 1, 16 in layer 2, ...), prompted with <b>points_per_side</b> divided
+by <b>crop_points_downscale</b> per layer.</p>
+<p>Each crop is resized to 1008 x 1008 pixels, regardless of its aspect
+ratio, as SAM 3 does, and passed through the image encoder. The mask
+decoder is then prompted with a grid of <b>points_per_side</b> x
+<b>points_per_side</b> points, <b>batch</b> prompts at a time, returning three
+candidate masks per point. A mask is kept if its predicted IoU exceeds
+<b>iou_threshold</b> and its stability score (the IoU of the mask
+thresholded at plus and minus <b>stability_offset</b>) is at least
+<b>stability_threshold</b>. Duplicates whose bounding boxes overlap by more
+than <b>nms_threshold</b> (IoU) are suppressed, keeping the best one. Masks
+touching an inner tile or crop edge are discarded, since the neighbouring
+tile sees them whole. Holes and islands smaller than <b>minsize</b> cells
+are finally removed from each mask.</p>
+<p>As in SAM 3's point predictor, holes of at most 256 pixels in each
+288 x 288 low-resolution mask are filled before the mask is resized to
+the crop. The other steps and their defaults are those of SAM 2's
+<code>SAM2AutomaticMaskGenerator</code> (SAM 3 has no generator of its own), plus
+the full-resolution removal of holes and islands smaller than
+<b>minsize</b> cells. With <b>minsize</b>=0, the module returns the same masks
+as those steps run on the PyTorch SAM 3 predictor.</p>
+<h3>Vectorization and cleaning</h3>
+<p>SAM 3 masks overlap: a field and the parcels inside it can both be
+masks. The <b>overlap</b> rule chooses which mask a cell belongs to: the
+smallest covering mask (<em>small</em>, finest partition, the default), the
+largest (<em>large</em>) or the one with the highest predicted IoU (<em>score</em>).
+Masks larger than <b>maxsize</b> cells are discarded first; this is the way
+to drop the single mask SAM 3 often returns for the whole background of
+a scene.</p>
+<p>The resulting label raster is cleaned: every connected piece smaller
+than <b>minsize</b> cells, including small unsegmented gaps, is merged into
+the neighbouring piece it shares the longest border with. Boundaries are
+traced along cell edges into shared topological boundaries, simplified
+with the Douglas-Peucker algorithm using the <b>simplify</b> tolerance (one
+cell by default; 0 keeps the raster staircase), and the topology is
+cleaned (boundaries broken at intersections, duplicates removed,
+pseudo-nodes merged, slivers smaller than one cell removed). Each segment
+gets one centroid, placed at the cell farthest from its border.</p>
+<p>Areas without a centroid are gaps that no mask covers. The optional
+<b>raster</b> output holds the segment categories of the cleaned label
+raster before simplification.</p>
+<h3>Attribute table</h3>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>cat</td>
+<td>Segment category</td>
+</tr>
+<tr>
+<td>mask</td>
+<td>Number of the SAM 3 mask the segment comes from</td>
+</tr>
+<tr>
+<td>predicted_iou</td>
+<td>Mask quality predicted by SAM 3</td>
+</tr>
+<tr>
+<td>stability</td>
+<td>Stability score of the mask</td>
+</tr>
+<tr>
+<td>cells</td>
+<td>Segment size in cells</td>
+</tr>
+<tr>
+<td>area</td>
+<td>Area of the simplified polygon in square map units</td>
+</tr>
+</tbody>
+</table>
+<p>With text prompts, the table holds the columns <b>cat</b>, <b>mask</b>,
+<b>prompt</b> (the text prompt that found the segment), <b>score</b> (its
+detection score), <b>cells</b> and <b>area</b>.</p>
+<p>A mask split into several pieces by overlapping masks yields several
+segments with the same <b>mask</b> number.</p>
+<h2>NOTES</h2>
+<h3>Differences from SAM and SAM 2</h3>
+<p>SAM 3's image encoder is a 32-block vision transformer (Perception
+Encoder, 1024 channels, 2D rotary position encoding, windowed attention
+with four global blocks) trained jointly for concept detection and
+tracking. Its point-prompt head is SAM 2's mask decoder on a 72 x 72
+embedding of a 1008-pixel input, fed with 288 and 144 pixel
+high-resolution features from a SimpleFPN neck. The encoder needs about
+as much computation per crop as SAM's ViT-H, much more than SAM 2's.</p>
+<h3>OpenCL device</h3>
+<p>With <b>device</b>=<em>auto</em>, the first GPU is used, else the first CPU
+device. When several OpenCL platforms expose the same device (for
+example Mesa's Clover and rusticl drivers for AMD GPUs), the first
+platform on which the kernels compile is used; <b>platform</b> restricts
+the choice to platforms whose name contains the given text. Mesa's
+rusticl only exposes a GPU when enabled in the environment, e.g.
+<code>RUSTICL_ENABLE=radeonsi</code>. A CPU OpenCL implementation such as PoCL
+gives the same result, much more slowly.</p>
+<p>The weights used take 1739 MiB of device memory (the checkpoint's
+text encoder, detector and tracker memory are not loaded) and the work
+buffers 2497 MiB with <b>batch</b>=32; a smaller <b>batch</b> reduces the mask
+decoder's share. Buffers are kept below the device's maximum allocation
+size.</p>
+<h3>Performance</h3>
+<p>On a CPU (Intel Core i7-1165G7, 4 cores, PoCL), the image encoder took
+about 1020 s per crop and the mask decoder about 46 s per 64 prompts;
+with text prompts, the concept detector and its masks took about 75 s per
+prompt and crop. A GPU is expected to be one to two orders of magnitude
+faster. The number of crops, and so the run time, grows with the region
+size divided by <b>tile_size</b>, and with <b>crop_layers</b>.</p>
+<h3>Choosing the resolution</h3>
+<p>SAM 3 sees every crop at 1008 x 1008 pixels. Objects should span at
+least ten or so pixels at that scale: set the region resolution and
+<b>tile_size</b> accordingly. A smaller <b>tile_size</b> zooms in (crops are
+upsampled to 1008 pixels), which finds smaller objects at the cost of
+more crops. Square tiles avoid distorting objects: a crop much longer
+than wide is squashed to a square.</p>
+<h3>Text encoder and tokenizer</h3>
+<p>The text encoder (1.2 GiB of weights) is loaded, run once for all the
+prompts and released before the image is processed. Its tokenizer is a C
+port of CLIP's byte-pair encoder, reading the vocabulary file installed
+with the module (<code>bpe_simple_vocab_16e6.txt.gz</code>, from OpenAI CLIP, MIT
+licence); prompts must be plain ASCII.</p>
+<h3>Debugging aids</h3>
+<p>When the environment variable <code>I_SAM3_OPENCL_DUMP</code> names a directory,
+the 8-bit crops, the encoder inputs, the image embeddings, the
+high-resolution features (with text prompts: the detector features and
+the first prompt's text features) and the list of masks are written
+there. The scripts <code>tests/reference_compare.py</code> and
+<code>tests/reference_compare_text.py</code> in the source tree compare them with
+the PyTorch reference implementation.
+<code>I_SAM3_OPENCL_PROFILE=1</code> prints the time spent in each OpenCL kernel.
+<code>I_SAM3_OPENCL_DOWNLOAD_URL</code> replaces the download location
+(<code>https://huggingface.co/facebook/sam3/resolve/main</code>), for a local
+mirror.</p>
+<h2>EXAMPLES</h2>
+<h3>Landsat scene (North Carolina sample dataset)</h3>
+<p>Segment a true-colour composite of Landsat 7 bands 3, 2 and 1, dropping
+the background mask (the region has 475 x 527 cells); <code>sam3.pt</code> is taken
+from, or downloaded into, <code>~/models/sam/sam3</code>:</p>
+<pre><code class="language-sh">g.region raster=lsat7_2002_30 -p
+i.group group=lsat_rgb input=lsat7_2002_30,lsat7_2002_20,lsat7_2002_10
+i.sam3.opencl group=lsat_rgb output=lsat_segments maxsize=50000
+v.db.select lsat_segments | head
+</code></pre>
+<h3>Text prompts</h3>
+<p>Find the buildings and the swimming pools of an orthophoto, keeping
+detections with a score of at least 0.6:</p>
+<pre><code class="language-sh">i.group group=ortho_rgb input=ortho.red,ortho.green,ortho.blue
+g.region raster=ortho.red -p
+i.sam3.opencl group=ortho_rgb output=found \
+    prompt=&quot;building,swimming pool&quot; threshold=0.6
+v.db.select found columns=cat,prompt,score,area | head
+</code></pre>
+<h3>Agricultural parcels</h3>
+<p>Delineate fields in a 2.5 m VNIR image with bands 1-3 grouped as RGB,
+keeping only segments of at least 0.1 ha (160 cells) and a label raster
+alongside the vector map:</p>
+<pre><code class="language-sh">i.group group=vnir_rgb input=vnir.1,vnir.2,vnir.3
+g.region raster=vnir.1 -p
+i.sam3.opencl group=vnir_rgb output=fields raster=fields minsize=160
+</code></pre>
+<h2>REFERENCES</h2>
+<p>Carion, N., Gustafson, L., Hu, Y.-T., Debnath, S., Hu, R., Suris, D., et
+al., 2025. SAM 3: Segment Anything with Concepts.
+<a href="https://arxiv.org/abs/2511.16719">arXiv:2511.16719</a></p>
+<h2>SEE ALSO</h2>
+<p><em><a href="i.group.html">i.group</a>, <a href="i.sam.opencl.html">i.sam.opencl</a>,
+<a href="i.sam2.opencl.html">i.sam2.opencl</a>,
+<a href="i.segment.html">i.segment</a>, <a href="r.to.vect.html">r.to.vect</a>,
+<a href="v.clean.html">v.clean</a>, <a href="v.generalize.html">v.generalize</a></em></p>
+<h2>AUTHORS</h2>
+<p>Yann Chemin</p>

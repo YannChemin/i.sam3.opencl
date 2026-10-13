@@ -27,6 +27,7 @@
 #include "download.h"
 #include "image.h"
 #include "ocl_backend.h"
+#include "progress.h"
 #include "pth_loader.h"
 #include "sam3_model.h"
 #include "sam3_text.h"
@@ -167,7 +168,7 @@ int main(int argc, char *argv[])
     struct amg_params ap;
     struct vect_params vp;
     struct Cell_head win;
-    double lo, hi, t0, t1;
+    double lo, hi, t0, t1, load_gib;
     char source[GNAME_MAX * 2 + 32], *desc, *checkpoint, *dir = NULL;
 
     G_gisinit(argv[0]);
@@ -476,6 +477,16 @@ int main(int argc, char *argv[])
         vp.labels = opt.prompt->answers;
     }
 
+    /* One progress bar for the whole run: plan the work that the region
+     * and the options already determine; the checkpoint is added once
+     * it is open. */
+    progress_plan(PG_READ,
+                  (double)Rast_window_rows() * Rast_window_cols() / 1e6);
+    amg_plan(Rast_window_cols(), Rast_window_rows(), &ap,
+             atoi(opt.batch->answer));
+    progress_plan(PG_BUILD, 1);
+    progress_plan(PG_VECTOR, 1);
+
     /* Validate the cheap inputs (group, checkpoint index) before the
      * OpenCL device is initialized and the weights are uploaded. */
     image_read_group(opt.group->answer, opt.subgroup->answer, lo, hi, &img);
@@ -510,12 +521,23 @@ int main(int argc, char *argv[])
                       checkpoint);
     }
     G_free(checkpoint);
+    /* The tensors this mode reads: the whole detector for text prompts,
+     * the vision trunk, its SAM 2 neck and the point head otherwise. */
+    load_gib = ap.nprompts
+                   ? pth_bytes(&pf, "detector.")
+                   : pth_bytes(&pf, "detector.backbone.vision_backbone.") +
+                         pth_bytes(&pf, "tracker.sam_");
+    load_gib /= 1073741824.0;
+    progress_plan(PG_LOAD, load_gib);
 
     t0 = now();
+    progress_begin(PG_BUILD, 1);
     ocl_init(&ocl, opt.device->answer, opt.platform->answer);
+    progress_begin(PG_LOAD, load_gib);
     sam_load(&model, &ocl, &pf, atoi(opt.batch->answer), ap.nprompts == 0);
     if (ap.nprompts)
         ap.text = text_load(&model, &pf, ap.nprompts, opt.prompt->answers);
+    progress_end();
     pth_close(&pf);
     t1 = now();
     G_message(_("Model ready in %.1f s"), t1 - t0);
@@ -531,6 +553,7 @@ int main(int argc, char *argv[])
     ocl_free(&ocl);
 
     vectorize_masks(&masks, &img, &vp);
+    progress_finish();
     G_message(_("Vectorization took %.1f s"), now() - t0);
 
     mask_list_free(&masks);

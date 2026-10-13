@@ -22,6 +22,7 @@
 #include <grass/raster.h>
 #include <grass/vector.h>
 
+#include "progress.h"
 #include "vectorize.h"
 
 /* Overlap resolution: paint masks so that the winning mask of every
@@ -625,7 +626,7 @@ static void write_boundaries(struct Map_info *Map, const int *K, int rows,
 
     /* Chains between nodes. */
     for (r = 0; r <= rows; r++) {
-        G_percent(r, rows + 1, 10);
+        progress_part(0.4 + 0.4 * r / (rows + 1), 1);
         for (c = 0; c <= cols; c++) {
             int deg = degree(&t, r, c);
 
@@ -639,7 +640,6 @@ static void write_boundaries(struct Map_info *Map, const int *K, int rows,
             }
         }
     }
-    G_percent(1, 1, 1);
 
     /* Closed rings without any node. Every ring has a horizontal edge. */
     for (r = 0; r <= rows; r++)
@@ -794,19 +794,24 @@ void vectorize_masks(const struct mask_list *masks, const struct sam_image *img,
     G_get_window(&win);
     cellarea = win.ew_res * win.ns_res;
 
+    /* Rough shares of the vectorization time per step. */
+    progress_begin(PG_VECTOR, 1);
     G_message(_("Resolving mask overlaps..."));
     lab = paint_labels(masks, img, vp->overlap, vp->maxsize);
     for (i = 0; i < n; i++)
         if (!img->valid[i])
             lab[i] = -1;
 
+    progress_part(0.1, 1);
     comp = G_malloc(n * sizeof(int));
     nc = label_regions(lab, rows, cols, comp, &ckey, &csize);
     G_verbose_message(_("%d connected pieces before cleaning"), nc);
 
+    progress_part(0.2, 1);
     G_message(_("Merging pieces smaller than %ld cells..."), vp->minsize);
     parent = merge_small(comp, rows, cols, nc, ckey, csize, vp->minsize);
 
+    progress_part(0.3, 1);
     /* One category per final region carrying a mask label. */
     catof = G_calloc(nc, sizeof(int));
     for (c = 0; c < nc; c++)
@@ -835,6 +840,7 @@ void vectorize_masks(const struct mask_list *masks, const struct sam_image *img,
     if (vp->raster_out)
         write_label_raster(vp->raster_out, K, rows, cols, vp->source);
 
+    progress_part(0.35, 1);
     for (c = 1; c <= ncat; c++)
         seg[c].best_dist = -1;
     find_poles(K, rows, cols, seg);
@@ -861,6 +867,7 @@ void vectorize_masks(const struct mask_list *masks, const struct sam_image *img,
 
     /* Topology cleaning: simplification may create crossings, pseudo
      * nodes and slivers. */
+    progress_part(0.8, 1);
     G_message(_("Cleaning topology..."));
     Vect_build_partial(&Map, GV_BUILD_BASE);
     Vect_break_lines(&Map, GV_BOUNDARY, NULL);
@@ -887,8 +894,10 @@ void vectorize_masks(const struct mask_list *masks, const struct sam_image *img,
     Vect_build_partial(&Map, GV_BUILD_NONE);
     Vect_build(&Map);
 
+    progress_part(0.95, 1);
     write_attributes(&Map, seg, masks, cellarea, vp->labels);
     Vect_close(&Map);
+    progress_end();
 
     Vect_destroy_line_struct(Points);
     Vect_destroy_cats_struct(Cats);

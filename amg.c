@@ -22,6 +22,7 @@
 #include <grass/glocale.h>
 
 #include "amg.h"
+#include "progress.h"
 #include "tokenizer.h"
 
 /* Masks whose box lies within this many cells of an inner crop edge are
@@ -458,10 +459,12 @@ static void text_crop(struct sam_model *m, const struct sam_image *img,
     int k, n, b, i, before = out->n;
     double t0 = now();
 
+    progress_begin(PG_ENCODE, 1);
     image_encoder_input(img, c->x0, c->y0, w, h, encbuf);
     sam_encode_trunk(m, encbuf);
     text_set_image(p->text);
     clFinish(m->ocl->queue);
+    progress_end();
     G_verbose_message(_("Image encoder: %.2f s"), now() - t0);
     if (p->dump_dir) {
         size_t ne = (size_t)SAM_GRID * SAM_GRID * SAM_DIM;
@@ -489,7 +492,7 @@ static void text_crop(struct sam_model *m, const struct sam_image *img,
     }
 
     for (k = 0; k < p->nprompts; k++) {
-        G_percent(k, p->nprompts, 1);
+        progress_begin(PG_TEXT, 1);
         t0 = now();
         n = text_detect(p->text, k, (float)p->text_thresh, qidx, score);
         for (b = 0; b < n; b += cap) {
@@ -506,7 +509,7 @@ static void text_crop(struct sam_model *m, const struct sam_image *img,
         G_verbose_message(_("Prompt %d: %d detections, %.2f s"), k + 1, n,
                           now() - t0);
     }
-    G_percent(1, 1, 1);
+    progress_end();
     G_verbose_message(_("Crop %d: %d masks kept"), ci + 1, out->n - before);
     G_free(sel);
     G_free(stats);
@@ -529,9 +532,11 @@ static void process_crop(struct sam_model *m, const struct sam_image *img,
 
     double t0 = now(), t1;
 
+    progress_begin(PG_ENCODE, 1);
     image_encoder_input(img, c->x0, c->y0, w, h, encbuf);
     sam_encode(m, encbuf);
     clFinish(m->ocl->queue);
+    progress_end();
     t1 = now();
     G_verbose_message(_("Image encoder: %.2f s"), t1 - t0);
     if (p->dump_dir) {
@@ -594,7 +599,7 @@ static void process_crop(struct sam_model *m, const struct sam_image *img,
     for (b = 0; b < npts; b += m->batch) {
         int P = npts - b < m->batch ? npts - b : m->batch, nsel = 0;
 
-        G_percent(b, npts, 10);
+        progress_begin(PG_DECODE, 1);
         sam_decode(m, P, pts + 2 * (size_t)b, iou);
         for (i = 0; i < 3 * P; i++)
             if (p->pred_iou_thresh <= 0.0 || iou[i] > p->pred_iou_thresh)
@@ -613,7 +618,7 @@ static void process_crop(struct sam_model *m, const struct sam_image *img,
             accept_mask(m, img, c, k, st, iou[sel[k]], -1, &cl);
         }
     }
-    G_percent(1, 1, 1);
+    progress_end();
     G_verbose_message(_("Mask decoder, %d prompts: %.2f s"), npts, now() - t1);
 
     iouv = G_malloc((cl.n ? cl.n : 1) * sizeof(double));
@@ -632,30 +637,63 @@ static void process_crop(struct sam_model *m, const struct sam_image *img,
     G_free(stats);
 }
 
-void amg_generate(struct sam_model *m, const struct sam_image *img,
-                  const struct amg_params *p, struct mask_list *out)
+/* The crops of a W x H region: the crop layers of each of the nx x ny
+ * tiles. */
+static struct crop *region_crops(int W, int H, const struct amg_params *p,
+                                 int *ncrops, int *nx, int *ny)
 {
-    const int W = img->cols, H = img->rows;
-    int *xs, *ys, nx, ny, ix, iy, i, ncrops = 0, ccap = 0;
+    int *xs, *ys, ix, iy, ccap = 0;
     struct crop *crops = NULL;
-    float *encbuf;
 
-    memset(out, 0, sizeof(*out));
+    *ncrops = 0;
     xs = G_malloc((W + 2) * sizeof(int));
     ys = G_malloc((H + 2) * sizeof(int));
-    nx = tile_starts(W, p->tile_size, p->tile_overlap, xs);
-    ny = tile_starts(H, p->tile_size, p->tile_overlap, ys);
-    for (iy = 0; iy < ny; iy++) {
-        for (ix = 0; ix < nx; ix++) {
+    *nx = tile_starts(W, p->tile_size, p->tile_overlap, xs);
+    *ny = tile_starts(H, p->tile_size, p->tile_overlap, ys);
+    for (iy = 0; iy < *ny; iy++) {
+        for (ix = 0; ix < *nx; ix++) {
             int tw = W < p->tile_size ? W : p->tile_size;
             int th = H < p->tile_size ? H : p->tile_size;
 
             crop_boxes(tw, th, p->crop_layers, p->crop_overlap_ratio, xs[ix],
-                       ys[iy], &crops, &ncrops, &ccap);
+                       ys[iy], &crops, ncrops, &ccap);
         }
     }
     G_free(xs);
     G_free(ys);
+    return crops;
+}
+
+void amg_plan(int W, int H, const struct amg_params *p, int batch)
+{
+    int ncrops, nx, ny, i;
+    struct crop *crops = region_crops(W, H, p, &ncrops, &nx, &ny);
+
+    progress_plan(PG_ENCODE, ncrops);
+    for (i = 0; i < ncrops; i++) {
+        int n_side = (int)(p->points_per_side /
+                           pow(p->crop_points_downscale, crops[i].layer));
+        int npts = n_side < 1 ? 1 : n_side * n_side;
+
+        if (p->nprompts > 0)
+            progress_plan(PG_TEXT, p->nprompts);
+        else
+            progress_plan(PG_DECODE, (npts + batch - 1) / batch);
+    }
+    progress_plan(PG_CLEAN, 1);
+    G_free(crops);
+}
+
+void amg_generate(struct sam_model *m, const struct sam_image *img,
+                  const struct amg_params *p, struct mask_list *out)
+{
+    const int W = img->cols, H = img->rows;
+    int nx, ny, i, ncrops;
+    struct crop *crops;
+    float *encbuf;
+
+    memset(out, 0, sizeof(*out));
+    crops = region_crops(W, H, p, &ncrops, &nx, &ny);
     if (nx * ny > 1)
         G_message(_("Region split into %d x %d tiles of %d cells"), nx, ny,
                   p->tile_size);
@@ -671,6 +709,7 @@ void amg_generate(struct sam_model *m, const struct sam_image *img,
     }
     G_free(encbuf);
 
+    progress_begin(PG_CLEAN, 1);
     for (i = 0; i < out->n; i++) {
         struct sam_mask *mk = &out->v[i];
         size_t j, n = (size_t)(mk->x1 - mk->x0 + 1) * (mk->y1 - mk->y0 + 1);
@@ -700,5 +739,6 @@ void amg_generate(struct sam_model *m, const struct sam_image *img,
                                       : p->crop_nms_thresh);
 
     G_free(crops);
+    progress_end();
     G_message(_("%d masks generated"), out->n);
 }

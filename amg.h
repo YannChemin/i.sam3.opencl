@@ -46,6 +46,11 @@ struct amg_params {
     double text_thresh;
 };
 
+/* Add the encoder, decoder or text detector work and the cleaning of a
+ * W x H region to the run's progress plan, for decoder batches of batch
+ * point prompts. */
+void amg_plan(int W, int H, const struct amg_params *p, int batch);
+
 void amg_generate(struct sam_model *m, const struct sam_image *img,
                   const struct amg_params *p, struct mask_list *out);
 

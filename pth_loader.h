@@ -47,6 +47,9 @@ const struct pth_tensor *pth_require(const struct pth_file *pf,
 
 long pth_numel(const struct pth_tensor *t);
 
+/* Total storage bytes of the tensors whose names start with prefix. */
+double pth_bytes(const struct pth_file *pf, const char *prefix);
+
 /* Read a real tensor as a newly allocated, C-contiguous float32 array. */
 float *pth_read_f32(const struct pth_file *pf, const struct pth_tensor *t);
 

@@ -164,19 +164,20 @@ rusticl only exposes a GPU when enabled in the environment, e.g.
 `RUSTICL_ENABLE=radeonsi`. A CPU OpenCL implementation such as PoCL
 gives the same result, much more slowly.
 
-The weights used take @WEIGHTS@ MiB of device memory (the checkpoint's
+The weights used take 1739 MiB of device memory (the checkpoint's
 text encoder, detector and tracker memory are not loaded) and the work
-buffers @WORK@ MiB with **batch**=32; a smaller **batch** reduces the mask
+buffers 2497 MiB with **batch**=32; a smaller **batch** reduces the mask
 decoder's share. Buffers are kept below the device's maximum allocation
 size.
 
 ### Performance
 
 On a CPU (Intel Core i7-1165G7, 4 cores, PoCL), the image encoder took
-@ENC@ s per crop and the mask decoder @DEC@ s per 64 prompts. A GPU is
-expected to be one to two orders of magnitude faster. The number of
-crops, and so the run time, grows with the region size divided by
-**tile_size**, and with **crop_layers**.
+about 1020 s per crop and the mask decoder about 46 s per 64 prompts;
+with text prompts, the concept detector and its masks took about 75 s per
+prompt and crop. A GPU is expected to be one to two orders of magnitude
+faster. The number of crops, and so the run time, grows with the region
+size divided by **tile_size**, and with **crop_layers**.
 
 ### Choosing the resolution
 

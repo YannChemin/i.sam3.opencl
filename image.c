@@ -19,6 +19,7 @@
 #include <grass/raster.h>
 
 #include "image.h"
+#include "progress.h"
 #include "sam3_model.h"
 
 #define NBINS 65536
@@ -98,6 +99,7 @@ void image_read_group(const char *group, const char *subgroup, double lo,
     img->rows = nrows;
     img->cols = ncols;
     img->rgb = G_calloc(n * 3, 1);
+    progress_begin(PG_READ, n / 1e6);
     img->valid = G_calloc(n, 1);
 
     for (b = 0; b < 3; b++) {
@@ -114,7 +116,7 @@ void image_read_group(const char *group, const char *subgroup, double lo,
     /* Pass 1: validity mask and per-band range over the region. */
     G_message(_("Reading imagery group <%s>..."), group);
     for (row = 0; row < nrows; row++) {
-        G_percent(row, nrows, 5);
+        progress_part(row, 3.0 * nrows);
         for (b = 0; b < 3; b++)
             Rast_get_d_row(fd[b], buf[b], row);
         for (col = 0; col < ncols; col++) {
@@ -134,7 +136,6 @@ void image_read_group(const char *group, const char *subgroup, double lo,
             }
         }
     }
-    G_percent(1, 1, 1);
     if (total == 0)
         G_fatal_error(_("No cell has valid values in all three bands in the "
                         "current region"));
@@ -142,6 +143,7 @@ void image_read_group(const char *group, const char *subgroup, double lo,
     /* Pass 2: per-band histograms for the percentile stretch. */
     hist = G_calloc(3L * NBINS, sizeof(long));
     for (row = 0; row < nrows; row++) {
+        progress_part(nrows + row, 3.0 * nrows);
         for (b = 0; b < 3; b++)
             Rast_get_d_row(fd[b], buf[b], row);
         for (col = 0; col < ncols; col++) {
@@ -176,6 +178,7 @@ void image_read_group(const char *group, const char *subgroup, double lo,
 
     /* Pass 3: 8-bit conversion. */
     for (row = 0; row < nrows; row++) {
+        progress_part(2.0 * nrows + row, 3.0 * nrows);
         for (b = 0; b < 3; b++)
             Rast_get_d_row(fd[b], buf[b], row);
         for (col = 0; col < ncols; col++) {
@@ -200,6 +203,7 @@ void image_read_group(const char *group, const char *subgroup, double lo,
         G_free(buf[b]);
     }
     I_free_group_ref(&ref);
+    progress_end();
 }
 
 /* PIL's 8-bit bilinear resampling (Resample.c): per-output-pixel
