@@ -12,11 +12,11 @@ and Intel compute-runtime. Still open:
       the checkpoint-gated tests cover the rectangles image.
 - [ ] Install into `/usr/local/grass86` once that check passes (only the
       dev tree is built).
-- [ ] Intel GPUs: `gemm_big` runs at about 70 GFLOP/s (3 % of peak) on
-      the Iris Xe and takes 103 of 124 s per SAM 3 crop. A 4x4-block
-      variant was measured slower (53 GFLOP/s) and dropped on 2026-10-26:
-      the limit is local-memory traffic, not registers. Write a GEMM on
-      `cl_intel_subgroups` block reads and shuffles, without local memory.
+- [ ] Intel GPUs: on mains power `gemm_big` reaches about 970 GFLOP/s
+      (46 % of peak) on the Iris Xe; a 4x4-block variant reached 720 and
+      was dropped on 2026-10-26. Next: `cl_intel_subgroups` block reads,
+      and XMX on Xe2 and later. (Timings on battery are about 14x lower:
+      benchmark on mains power only.)
 - [ ] Intel XMX through `cl_intel_subgroup_matrix_multiply_accumulate`
       (Xe2/Xe3, Arc Pro B50/B60, Panther Lake).
 - [ ] Host BLAS (`cblas_sgemm` on mapped buffers) as a further `cpu` path.

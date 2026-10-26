@@ -412,11 +412,11 @@ cl_mem ocl_alloc(struct ocl_backend *ocl, size_t n, const char *what)
                         "batch= or tile_size=)"),
                       what, (unsigned long)(n >> 20),
                       (unsigned long)(ocl->max_alloc >> 20));
-    /* Unified-memory devices (cpu, igpu) get buffers in host memory, which
-     * the driver can hand to the device without a copy. */
+    /* A CPU device gets buffers in host memory. On an integrated GPU the
+     * driver places them: host-allocated buffers made Intel's kernels
+     * about 15 % slower; transfers are mapped instead (ocl_write). */
     m = clCreateBuffer(ocl->context,
-                       CL_MEM_READ_WRITE | (ocl->arch == OCL_ARCH_CPU ||
-                                                    ocl->arch == OCL_ARCH_IGPU
+                       CL_MEM_READ_WRITE | (ocl->arch == OCL_ARCH_CPU
                                                 ? CL_MEM_ALLOC_HOST_PTR
                                                 : 0),
                        n, NULL, &err);
