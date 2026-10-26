@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <grass/gis.h>
 #include <grass/glocale.h>
@@ -61,6 +62,31 @@ cl_mem load_dev(struct sam_model *m, const struct pth_file *pf,
     return b;
 }
 
+cl_mem load_dev_w(struct sam_model *m, const struct pth_file *pf,
+                  const char *name, int ndim, const long *shape)
+{
+    const struct pth_tensor *t = pth_require(pf, name, ndim, shape);
+    float *h = pth_read_f32(pf, t);
+    size_t n = pth_numel(t);
+    cl_mem b = ocl_upload_weight(m->ocl, h, n, name);
+
+    loaded_bytes += n * (m->ocl->fp16w ? 2 : sizeof(float));
+    G_free(h);
+    return b;
+}
+
+cl_mem load_dev_w_fmt(struct sam_model *m, const struct pth_file *pf, int ndim,
+                      const long *shape, const char *fmt, ...)
+{
+    char name[256];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(name, sizeof(name), fmt, ap);
+    va_end(ap);
+    return load_dev_w(m, pf, name, ndim, shape);
+}
+
 float *load_host(const struct pth_file *pf, const char *name, int ndim,
                  const long *shape)
 {
@@ -96,13 +122,13 @@ static void load_attn(struct sam_model *m, const struct pth_file *pf,
     long b_in[1] = {dint}, b_out[1] = {SAM_DIM};
 
     a->dint = dint;
-    a->qw = load_dev_fmt(m, pf, 2, w_in, "%s.q_proj.weight", prefix);
+    a->qw = load_dev_w_fmt(m, pf, 2, w_in, "%s.q_proj.weight", prefix);
     a->qb = load_dev_fmt(m, pf, 1, b_in, "%s.q_proj.bias", prefix);
-    a->kw = load_dev_fmt(m, pf, 2, w_in, "%s.k_proj.weight", prefix);
+    a->kw = load_dev_w_fmt(m, pf, 2, w_in, "%s.k_proj.weight", prefix);
     a->kb = load_dev_fmt(m, pf, 1, b_in, "%s.k_proj.bias", prefix);
-    a->vw = load_dev_fmt(m, pf, 2, w_in, "%s.v_proj.weight", prefix);
+    a->vw = load_dev_w_fmt(m, pf, 2, w_in, "%s.v_proj.weight", prefix);
     a->vb = load_dev_fmt(m, pf, 1, b_in, "%s.v_proj.bias", prefix);
-    a->ow = load_dev_fmt(m, pf, 2, w_out, "%s.out_proj.weight", prefix);
+    a->ow = load_dev_w_fmt(m, pf, 2, w_out, "%s.out_proj.weight", prefix);
     a->ob = load_dev_fmt(m, pf, 1, b_out, "%s.out_proj.bias", prefix);
 }
 
@@ -123,24 +149,44 @@ static void release_attn(struct sam_attn_w *a)
 /* Accumulated kernel times when profiling is enabled. */
 static struct {
     const char *what;
-    double ms;
+    double ms, wall_ms, flops;
     long calls;
 } prof[64];
 static int nprof;
+/* FLOPs of the next launch, set by gemm() for the profile. */
+static double pending_flops;
+
+static double now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+}
 
 void run(struct sam_model *m, cl_kernel k, int dim, const size_t *g,
          const size_t *l, const char *what)
 {
     cl_event ev;
     cl_ulong t0, t1;
+    double w0 = 0.0, w1;
     int i;
 
+    /* Wall time as well as event time: some drivers (rusticl on iris,
+     * Mesa 25.0) return wrong event timestamps. */
+    if (m->ocl->profile) {
+        clFinish(m->ocl->queue);
+        w0 = now_ms();
+    }
     ocl_check(clEnqueueNDRangeKernel(m->ocl->queue, k, dim, NULL, g, l, 0, NULL,
                                      m->ocl->profile ? &ev : NULL),
               what);
-    if (!m->ocl->profile)
+    if (!m->ocl->profile) {
+        pending_flops = 0.0;
         return;
+    }
     clWaitForEvents(1, &ev);
+    w1 = now_ms();
     clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(t0), &t0,
                             NULL);
     clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(t1), &t1,
@@ -148,12 +194,16 @@ void run(struct sam_model *m, cl_kernel k, int dim, const size_t *g,
     clReleaseEvent(ev);
     for (i = 0; i < nprof && strcmp(prof[i].what, what) != 0; i++)
         ;
+
     if (i == nprof && nprof < 64)
         prof[nprof++].what = what;
     if (i < 64) {
         prof[i].ms += (t1 - t0) * 1e-6;
+        prof[i].wall_ms += w1 - w0;
+        prof[i].flops += pending_flops;
         prof[i].calls++;
     }
+    pending_flops = 0.0;
 }
 
 void run1d(struct sam_model *m, cl_kernel k, size_t n, const char *what)
@@ -191,7 +241,24 @@ void gemm(struct sam_model *m, int M, int N, int K, struct opnd A,
               A.off % 4 == 0 && A.s0 % 4 == 0 && A.s1 % 4 == 0 &&
               B.ld % 4 == 0 && B.off % 4 == 0 && B.s0 % 4 == 0 && B.s1 % 4 == 0;
     int tile = big ? 128 : 64;
-    cl_kernel k = big ? m->k_gemm_big : m->k_gemm;
+    int half = m->ocl->fp16w && ocl_is_half(B.buf);
+    int cpu = m->ocl->arch == OCL_ARCH_CPU;
+    cl_kernel k;
+    const char *what;
+
+    if (cpu) {
+        k = transb ? (half ? m->k_gemm_cpu_t_h : m->k_gemm_cpu_t)
+                   : (half ? m->k_gemm_cpu_n_h : m->k_gemm_cpu_n);
+        what = transb ? "gemm_cpu_t" : "gemm_cpu_n";
+    }
+    else if (big) {
+        k = half ? m->k_gemm_big_h : m->k_gemm_big;
+        what = "gemm_big";
+    }
+    else {
+        k = half ? m->k_gemm_h : m->k_gemm;
+        what = "gemm";
+    }
 
     SETARG(k, 0, cM);
     SETARG(k, 1, cN);
@@ -218,10 +285,20 @@ void gemm(struct sam_model *m, int M, int N, int K, struct opnd A,
     SETARG(k, 22, croff);
     SETARG(k, 23, calpha);
     SETARG(k, 24, cact);
+    pending_flops = 2.0 * M * N * K * nb;
+    if (cpu) {
+        /* One work-item per 2 x 4 (transb) or 4 x 8 output block; the
+         * work-group size is left to the driver. */
+        g[0] = transb ? (size_t)(N + 3) / 4 : (size_t)(N + 7) / 8;
+        g[1] = transb ? (size_t)(M + 1) / 2 : (size_t)(M + 3) / 4;
+        g[2] = nb;
+        run(m, k, 3, g, NULL, what);
+        return;
+    }
     g[0] = (size_t)((N + tile - 1) / tile) * 16;
     g[1] = (size_t)((M + tile - 1) / tile) * 16;
     g[2] = nb;
-    run(m, k, 3, g, l, big ? "gemm_big" : "gemm");
+    run(m, k, 3, g, l, what);
 }
 
 /* Y[rows, out] = act(X[rows, in] W^T + b) (+ Y when residual). */
@@ -480,21 +557,21 @@ static void load_encoder(struct sam_model *m, const struct pth_file *pf)
         b->n2b = load_dev_fmt(m, pf, 1, s1, "%s.%d.norm2.bias", p, i);
         s2[0] = 3 * E;
         s2[1] = E;
-        b->qkvw = load_dev_fmt(m, pf, 2, s2, "%s.%d.attn.qkv.weight", p, i);
+        b->qkvw = load_dev_w_fmt(m, pf, 2, s2, "%s.%d.attn.qkv.weight", p, i);
         s1[0] = 3 * E;
         b->qkvb = load_dev_fmt(m, pf, 1, s1, "%s.%d.attn.qkv.bias", p, i);
         s2[0] = E;
-        b->projw = load_dev_fmt(m, pf, 2, s2, "%s.%d.attn.proj.weight", p, i);
+        b->projw = load_dev_w_fmt(m, pf, 2, s2, "%s.%d.attn.proj.weight", p, i);
         s1[0] = E;
         b->projb = load_dev_fmt(m, pf, 1, s1, "%s.%d.attn.proj.bias", p, i);
         s2[0] = m->mlp;
         s2[1] = E;
-        b->l1w = load_dev_fmt(m, pf, 2, s2, "%s.%d.mlp.fc1.weight", p, i);
+        b->l1w = load_dev_w_fmt(m, pf, 2, s2, "%s.%d.mlp.fc1.weight", p, i);
         s1[0] = m->mlp;
         b->l1b = load_dev_fmt(m, pf, 1, s1, "%s.%d.mlp.fc1.bias", p, i);
         s2[0] = E;
         s2[1] = m->mlp;
-        b->l2w = load_dev_fmt(m, pf, 2, s2, "%s.%d.mlp.fc2.weight", p, i);
+        b->l2w = load_dev_w_fmt(m, pf, 2, s2, "%s.%d.mlp.fc2.weight", p, i);
         s1[0] = E;
         b->l2b = load_dev_fmt(m, pf, 1, s1, "%s.%d.mlp.fc2.bias", p, i);
     }
@@ -622,11 +699,11 @@ static void load_decoder(struct sam_model *m, const struct pth_file *pf)
         L->n3b = load_dev_fmt(m, pf, 1, v256, "%s.%d.norm3.bias", p, i);
         L->n4w = load_dev_fmt(m, pf, 1, v256, "%s.%d.norm4.weight", p, i);
         L->n4b = load_dev_fmt(m, pf, 1, v256, "%s.%d.norm4.bias", p, i);
-        L->m1w = load_dev_fmt(m, pf, 2, (long[]){2048, SAM_DIM},
+        L->m1w = load_dev_w_fmt(m, pf, 2, (long[]){2048, SAM_DIM},
                               "%s.%d.mlp.lin1.weight", p, i);
         L->m1b =
             load_dev_fmt(m, pf, 1, (long[]){2048}, "%s.%d.mlp.lin1.bias", p, i);
-        L->m2w = load_dev_fmt(m, pf, 2, (long[]){SAM_DIM, 2048},
+        L->m2w = load_dev_w_fmt(m, pf, 2, (long[]){SAM_DIM, 2048},
                               "%s.%d.mlp.lin2.weight", p, i);
         L->m2b = load_dev_fmt(m, pf, 1, v256, "%s.%d.mlp.lin2.bias", p, i);
     }
@@ -848,6 +925,14 @@ void sam_load(struct sam_model *m, struct ocl_backend *ocl,
 
     m->k_gemm = ocl_kernel(ocl, "gemm");
     m->k_gemm_big = ocl_kernel(ocl, "gemm_big");
+    m->k_gemm_cpu_t = ocl_kernel(ocl, "gemm_cpu_t");
+    m->k_gemm_cpu_n = ocl_kernel(ocl, "gemm_cpu_n");
+    if (ocl->fp16w) {
+        m->k_gemm_h = ocl_kernel_h(ocl, "gemm");
+        m->k_gemm_big_h = ocl_kernel_h(ocl, "gemm_big");
+        m->k_gemm_cpu_t_h = ocl_kernel_h(ocl, "gemm_cpu_t");
+        m->k_gemm_cpu_n_h = ocl_kernel_h(ocl, "gemm_cpu_n");
+    }
     m->k_ln = ocl_kernel(ocl, "layernorm");
     m->k_softmax = ocl_kernel(ocl, "softmax_rows");
     m->k_attn_few = ocl_kernel(ocl, "attn_fewkeys");
@@ -1448,9 +1533,17 @@ void sam_free(struct sam_model *m)
 {
     int p;
 
-    for (p = 0; p < nprof; p++)
-        G_message("kernel %-24s %8.1f ms %7ld calls", prof[p].what, prof[p].ms,
-                  prof[p].calls);
+    for (p = 0; p < nprof; p++) {
+        if (prof[p].flops > 0.0 && prof[p].wall_ms > 0.0)
+            G_message("kernel %-24s %8.1f ms (wall %8.1f ms) %7ld calls "
+                      "%8.1f GFLOP/s",
+                      prof[p].what, prof[p].ms, prof[p].wall_ms, prof[p].calls,
+                      prof[p].flops / (prof[p].wall_ms * 1e6));
+        else
+            G_message("kernel %-24s %8.1f ms (wall %8.1f ms) %7ld calls",
+                      prof[p].what, prof[p].ms, prof[p].wall_ms,
+                      prof[p].calls);
+    }
 
     cl_mem *bufs[] = {
         &m->pe_w,      &m->pos,   &m->lnpw,    &m->lnpb,    &m->rope_win,
@@ -1470,7 +1563,10 @@ void sam_free(struct sam_model *m)
                            m->k_attn_many, m->k_ln,       m->k_softmax,
                            m->k_patch,     m->k_add,      m->k_wpart,
                            m->k_wunpart,   m->k_rope,     m->k_im2col,
-                           m->k_convt,     m->k_logits,   m->k_post};
+                           m->k_convt,     m->k_logits,   m->k_post,
+                           m->k_gemm_cpu_t, m->k_gemm_cpu_n, m->k_gemm_h,
+                           m->k_gemm_big_h, m->k_gemm_cpu_t_h,
+                           m->k_gemm_cpu_n_h};
     size_t i;
     int j;
 

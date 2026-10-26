@@ -156,7 +156,7 @@ int main(int argc, char *argv[])
         struct Option *group, *subgroup, *checkpoint, *weights_dir, *output,
             *raster, *percentile, *points, *pred_iou, *stability, *stab_offset,
             *nms, *crop_layers, *crop_downscale, *minsize, *maxsize, *overlap,
-            *simplify, *tile_size, *tile_overlap, *batch, *device, *platform,
+            *simplify, *tile_size, *tile_overlap, *batch, *device, *platform, *profile, *precision,
             *prompt, *threshold;
     } opt;
     struct Flag *offline;
@@ -403,6 +403,34 @@ int main(int argc, char *argv[])
         _("Use only OpenCL platforms whose name contains this text");
     opt.platform->guisection = _("Processing");
 
+    opt.profile = G_define_option();
+    opt.profile->key = "profile";
+    opt.profile->type = TYPE_STRING;
+    opt.profile->options = "auto,cpu,igpu,dgpu,egpu";
+    opt.profile->answer = "auto";
+    opt.profile->description =
+        _("Device profile choosing buffers and kernels");
+    G_asprintf((char **)&opt.profile->descriptions,
+               "auto;%s;cpu;%s;igpu;%s;dgpu;%s;egpu;%s",
+               _("Detect from the device"),
+               _("Host-memory device (PoCL): mapped buffers, CPU kernels"),
+               _("GPU sharing host memory: zero-copy buffers"),
+               _("GPU with its own memory on internal PCIe"),
+               _("GPU behind a slow link (Thunderbolt, remote): pinned "
+                 "staging"));
+    opt.profile->guisection = _("Processing");
+
+    opt.precision = G_define_option();
+    opt.precision->key = "precision";
+    opt.precision->type = TYPE_STRING;
+    opt.precision->options = "fp32,fp16";
+    opt.precision->answer = "fp32";
+    opt.precision->description = _("Storage type of the weight matrices");
+    G_asprintf((char **)&opt.precision->descriptions, "fp32;%s;fp16;%s",
+               _("Single precision"),
+               _("Half precision storage, single precision arithmetic"));
+    opt.precision->guisection = _("Processing");
+
     offline = G_define_flag();
     offline->key = 'n';
     offline->description =
@@ -532,7 +560,8 @@ int main(int argc, char *argv[])
 
     t0 = now();
     progress_begin(PG_BUILD, 1);
-    ocl_init(&ocl, opt.device->answer, opt.platform->answer);
+    ocl_init(&ocl, opt.device->answer, opt.platform->answer,
+             opt.profile->answer, opt.precision->answer);
     progress_begin(PG_LOAD, load_gib);
     sam_load(&model, &ocl, &pf, atoi(opt.batch->answer), ap.nprompts == 0);
     if (ap.nprompts)

@@ -12,7 +12,7 @@
 #define ACT_GELU 1
 #define ACT_RELU 2
 
-#define SETARG(k, i, v) ocl_check(clSetKernelArg(k, i, sizeof(v), &(v)), #k)
+#define SETARG(k, i, v) ocl_setarg(k, i, sizeof(v), &(v), #k)
 
 /* One GEMM operand: buffer, element offset, leading dimension and the
  * two batch strides. */
@@ -27,6 +27,12 @@ cl_mem load_dev(struct sam_model *m, const struct pth_file *pf,
                 const char *name, int ndim, const long *shape);
 cl_mem load_dev_fmt(struct sam_model *m, const struct pth_file *pf, int ndim,
                     const long *shape, const char *fmt, ...);
+/* Linear weight matrices, used only as GEMM operand B: half with
+ * precision=fp16. */
+cl_mem load_dev_w(struct sam_model *m, const struct pth_file *pf,
+                  const char *name, int ndim, const long *shape);
+cl_mem load_dev_w_fmt(struct sam_model *m, const struct pth_file *pf, int ndim,
+                      const long *shape, const char *fmt, ...);
 float *load_host(const struct pth_file *pf, const char *name, int ndim,
                  const long *shape);
 void load_host_into(const struct pth_file *pf, const char *name, int ndim,

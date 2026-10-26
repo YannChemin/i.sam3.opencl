@@ -74,6 +74,10 @@ struct sam_model {
     cl_kernel k_gemm, k_gemm_big, k_attn_few, k_attn_many, k_ln, k_softmax,
         k_patch, k_add, k_wpart, k_wunpart, k_rope, k_im2col, k_convt, k_logits,
         k_post;
+    /* CPU GEMMs (profile=cpu), and the GEMMs reading half-precision
+     * weights (precision=fp16; NULL otherwise). */
+    cl_kernel k_gemm_cpu_t, k_gemm_cpu_n;
+    cl_kernel k_gemm_h, k_gemm_big_h, k_gemm_cpu_t_h, k_gemm_cpu_n_h;
 
     /* Encoder work buffers. */
     long score_cap; /* Floats of the attention score buffer. */

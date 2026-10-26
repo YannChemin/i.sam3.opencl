@@ -25,6 +25,21 @@
 #define ACT_GELU 1
 #define ACT_RELU 2
 
+/* Storage of GEMM operand B. Built with -DSAM_BHALF (precision=fp16),
+ * the weight matrices are IEEE half read with vload_half, which is core
+ * OpenCL and needs no cl_khr_fp16; the arithmetic stays float. */
+#ifdef SAM_BHALF
+#define BTYPE half
+#define LDB(p, i) vload_half(0, (p) + (i))
+#define LDB4(p) vload_half4(0, (p))
+#define LDB8(p) vload_half8(0, (p))
+#else
+#define BTYPE float
+#define LDB(p, i) ((p)[i])
+#define LDB4(p) vload4(0, (p))
+#define LDB8(p) vload8(0, (p))
+#endif
+
 float gelu_erf(float x)
 {
     return 0.5f * x * (1.0f + erf(x * 0.70710678118654752f));
@@ -55,7 +70,7 @@ float apply_act(float v, int act)
 __kernel __attribute__((reqd_work_group_size(16, 16, 1))) void
 gemm(const int M, const int N, const int K, __global const float *A,
      const long aoff, const int lda, const long sa0, const long sa1,
-     __global const float *B, const long boff, const int ldb, const long sb0,
+     __global const BTYPE *B, const long boff, const int ldb, const long sb0,
      const long sb1, const int transb, __global float *C, const long coff,
      const int ldc, const long sc0, const long sc1, const int nb1,
      __global const float *bias, __global const float *R, const long roff,
@@ -91,14 +106,15 @@ gemm(const int M, const int N, const int K, __global const float *A,
             if (transb) {
                 const int gn = n0 + r;
 
-                Bs[c][r] = (gn < N && gk < K) ? B[(long)gn * ldb + gk] : 0.0f;
+                Bs[c][r] =
+                    (gn < N && gk < K) ? LDB(B, (long)gn * ldb + gk) : 0.0f;
             }
             else {
                 const int kk = idx >> 6, nn = idx & 63;
                 const int gk2 = k0 + kk, gn = n0 + nn;
 
                 Bs[kk][nn] =
-                    (gn < N && gk2 < K) ? B[(long)gk2 * ldb + gn] : 0.0f;
+                    (gn < N && gk2 < K) ? LDB(B, (long)gk2 * ldb + gn) : 0.0f;
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -178,7 +194,7 @@ void store_row8(__global float *C, __global const float *R,
 __kernel __attribute__((reqd_work_group_size(16, 16, 1))) void
 gemm_big(const int M, const int N, const int K, __global const float *A,
          const long aoff, const int lda, const long sa0, const long sa1,
-         __global const float *B, const long boff, const int ldb,
+         __global const BTYPE *B, const long boff, const int ldb,
          const long sb0, const long sb1, const int transb, __global float *C,
          const long coff, const int ldc, const long sc0, const long sc1,
          const int nb1, __global const float *bias, __global const float *R,
@@ -221,7 +237,7 @@ gemm_big(const int M, const int N, const int K, __global const float *A,
 
                 v = 0.0f;
                 if (gn < N && gk < K)
-                    v = vload4(0, B + (long)gn * ldb + gk);
+                    v = LDB4(B + (long)gn * ldb + gk);
                 Bs[kq][r] = v.x;
                 Bs[kq + 1][r] = v.y;
                 Bs[kq + 2][r] = v.z;
@@ -233,17 +249,17 @@ gemm_big(const int M, const int N, const int K, __global const float *A,
 
                 v = 0.0f;
                 if (gk2 < K) {
-                    __global const float *bp = B + (long)gk2 * ldb + gn;
+                    __global const BTYPE *bp = B + (long)gk2 * ldb + gn;
 
                     if (gn + 3 < N)
-                        v = vload4(0, bp);
+                        v = LDB4(bp);
                     else {
                         if (gn < N)
-                            v.x = bp[0];
+                            v.x = LDB(bp, 0);
                         if (gn + 1 < N)
-                            v.y = bp[1];
+                            v.y = LDB(bp, 1);
                         if (gn + 2 < N)
-                            v.z = bp[2];
+                            v.z = LDB(bp, 2);
                     }
                 }
                 vstore4(v, 0, &Bs[kk][nq]);
@@ -286,6 +302,153 @@ gemm_big(const int M, const int N, const int K, __global const float *A,
     store_row8(C, R, bias, m0 + ty * 8 + 7, n0 + tx * 8, M, N, ldc, alpha, act,
                c70, c71);
 }
+
+/* Epilogue shared by the CPU GEMMs: one output element. */
+void store_one(__global float *C, __global const float *R,
+               __global const float *bias, const int m, const int n,
+               const int ldc, const float alpha, const int act, const float v)
+{
+    float x = alpha * v;
+
+    if (bias)
+        x += bias[n];
+    x = apply_act(x, act);
+    if (R)
+        x += R[(long)m * ldc + n];
+    C[(long)m * ldc + n] = x;
+}
+
+float hsum8(const float8 v)
+{
+    const float4 s = v.lo + v.hi;
+
+    return s.x + s.y + s.z + s.w;
+}
+
+/* CPU GEMMs (profile=cpu), same contract as gemm. No local memory and no
+ * barriers, which PoCL turns into slow scalar loops: each work-item owns
+ * a register block and streams the contiguous axis with float8 loads.
+ *
+ * transb != 0 (B stored N x K, the Linear weight layout): work-item
+ * (n / 4, m / 2) computes 2 x 4 outputs, dot products along K. */
+__kernel void gemm_cpu_t(const int M, const int N, const int K,
+                         __global const float *A, const long aoff,
+                         const int lda, const long sa0, const long sa1,
+                         __global const BTYPE *B, const long boff,
+                         const int ldb, const long sb0, const long sb1,
+                         const int transb, __global float *C, const long coff,
+                         const int ldc, const long sc0, const long sc1,
+                         const int nb1, __global const float *bias,
+                         __global const float *R, const long roff,
+                         const float alpha, const int act)
+{
+    const int n0 = get_global_id(0) * 4, m0 = get_global_id(1) * 2;
+    const int b = get_global_id(2);
+    const long bb0 = b / nb1, bb1 = b % nb1;
+    float8 s[2][4];
+    float t[2][4];
+    int i, j, k;
+
+    if (m0 >= M || n0 >= N)
+        return;
+    A += aoff + bb0 * sa0 + bb1 * sa1;
+    B += boff + bb0 * sb0 + bb1 * sb1;
+    C += coff + bb0 * sc0 + bb1 * sc1;
+    if (R)
+        R += roff + bb0 * sc0 + bb1 * sc1;
+
+    for (i = 0; i < 2; i++)
+        for (j = 0; j < 4; j++)
+            s[i][j] = 0.0f;
+    if (m0 + 1 < M && n0 + 3 < N) {
+        for (k = 0; k + 8 <= K; k += 8) {
+            const float8 a0 = vload8(0, A + (long)m0 * lda + k);
+            const float8 a1 = vload8(0, A + (long)(m0 + 1) * lda + k);
+
+            for (j = 0; j < 4; j++) {
+                const float8 bv = LDB8(B + (long)(n0 + j) * ldb + k);
+
+                s[0][j] = mad(a0, bv, s[0][j]);
+                s[1][j] = mad(a1, bv, s[1][j]);
+            }
+        }
+    }
+    else
+        k = 0;
+    for (i = 0; i < 2; i++)
+        for (j = 0; j < 4; j++) {
+            const int m = m0 + i, n = n0 + j;
+            float v = hsum8(s[i][j]);
+            int kk;
+
+            if (m >= M || n >= N)
+                continue;
+            for (kk = k; kk < K; kk++)
+                v = mad(A[(long)m * lda + kk], LDB(B, (long)n * ldb + kk), v);
+            t[i][j] = v;
+            store_one(C, R, bias, m, n, ldc, alpha, act, t[i][j]);
+        }
+}
+
+/* transb == 0 (B stored K x N): work-item (n / 8, m / 4) computes 4 x 8
+ * outputs, one float8 row of B per step of K. */
+__kernel void gemm_cpu_n(const int M, const int N, const int K,
+                         __global const float *A, const long aoff,
+                         const int lda, const long sa0, const long sa1,
+                         __global const BTYPE *B, const long boff,
+                         const int ldb, const long sb0, const long sb1,
+                         const int transb, __global float *C, const long coff,
+                         const int ldc, const long sc0, const long sc1,
+                         const int nb1, __global const float *bias,
+                         __global const float *R, const long roff,
+                         const float alpha, const int act)
+{
+    const int n0 = get_global_id(0) * 8, m0 = get_global_id(1) * 4;
+    const int b = get_global_id(2);
+    const long bb0 = b / nb1, bb1 = b % nb1;
+    float8 c[4];
+    int i, j, k;
+
+    if (m0 >= M || n0 >= N)
+        return;
+    A += aoff + bb0 * sa0 + bb1 * sa1;
+    B += boff + bb0 * sb0 + bb1 * sb1;
+    C += coff + bb0 * sc0 + bb1 * sc1;
+    if (R)
+        R += roff + bb0 * sc0 + bb1 * sc1;
+
+    for (i = 0; i < 4; i++)
+        c[i] = 0.0f;
+    if (n0 + 7 < N) {
+        for (k = 0; k < K; k++) {
+            const float8 bv = LDB8(B + (long)k * ldb + n0);
+
+            for (i = 0; i < 4; i++)
+                if (m0 + i < M)
+                    c[i] = mad((float8)(A[(long)(m0 + i) * lda + k]), bv, c[i]);
+        }
+        for (i = 0; i < 4 && m0 + i < M; i++) {
+            const float v[8] = {c[i].s0, c[i].s1, c[i].s2, c[i].s3,
+                                c[i].s4, c[i].s5, c[i].s6, c[i].s7};
+
+            for (j = 0; j < 8; j++)
+                store_one(C, R, bias, m0 + i, n0 + j, ldc, alpha, act, v[j]);
+        }
+        return;
+    }
+    for (i = 0; i < 4 && m0 + i < M; i++)
+        for (j = 0; j < 8 && n0 + j < N; j++) {
+            float v = 0.0f;
+
+            for (k = 0; k < K; k++)
+                v = mad(A[(long)(m0 + i) * lda + k],
+                        LDB(B, (long)k * ldb + n0 + j), v);
+            store_one(C, R, bias, m0 + i, n0 + j, ldc, alpha, act, v);
+        }
+}
+
+/* The other kernels are not needed in the half-precision GEMM program. */
+#ifndef SAM_GEMM_ONLY
 
 /* Sum and max of val over a work-group of n items (power of two). */
 float wg_sum(float val, __local float *scratch, const int n)
@@ -802,3 +965,5 @@ __kernel void up2_add(__global float *out, __global const float *A,
         return;
     out[gid] = A[gid] + Lo[((y / 2) * (W / 2) + x / 2) * C + c];
 }
+
+#endif /* SAM_GEMM_ONLY */

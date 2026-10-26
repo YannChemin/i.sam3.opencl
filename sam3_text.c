@@ -119,16 +119,17 @@ static void load_mha(struct sam_model *m, const struct pth_file *pf,
     snprintf(name, sizeof(name), "%s.in_proj_bias", prefix);
     t = pth_require(pf, name, 1, (long[]){3 * D});
     b = pth_read_f32(pf, t);
-    a->qw = ocl_upload(m->ocl, w, msz, prefix);
-    a->kw = ocl_upload(m->ocl, w + D * D, msz, prefix);
-    a->vw = ocl_upload(m->ocl, w + 2 * D * D, msz, prefix);
+    a->qw = ocl_upload_weight(m->ocl, w, msz / sizeof(float), prefix);
+    a->kw = ocl_upload_weight(m->ocl, w + D * D, msz / sizeof(float), prefix);
+    a->vw =
+        ocl_upload_weight(m->ocl, w + 2 * D * D, msz / sizeof(float), prefix);
     a->qb = ocl_upload(m->ocl, b, vsz, prefix);
     a->kb = ocl_upload(m->ocl, b + D, vsz, prefix);
     a->vb = ocl_upload(m->ocl, b + 2 * D, vsz, prefix);
     G_free(w);
     G_free(b);
     a->ow =
-        load_dev_fmt(m, pf, 2, (long[]){D, D}, "%s.out_proj.weight", prefix);
+        load_dev_w_fmt(m, pf, 2, (long[]){D, D}, "%s.out_proj.weight", prefix);
     a->ob = load_dev_fmt(m, pf, 1, (long[]){D}, "%s.out_proj.bias", prefix);
 }
 
@@ -164,10 +165,10 @@ static void load_xlayer(struct sam_model *m, const struct pth_file *pf,
     l->n3w = vec_dev(m, pf, prefix, "norm3.weight");
     l->n3b = vec_dev(m, pf, prefix, "norm3.bias");
     l->l1w =
-        load_dev_fmt(m, pf, 2, (long[]){FFN, D}, "%s.linear1.weight", prefix);
+        load_dev_w_fmt(m, pf, 2, (long[]){FFN, D}, "%s.linear1.weight", prefix);
     l->l1b = load_dev_fmt(m, pf, 1, (long[]){FFN}, "%s.linear1.bias", prefix);
     l->l2w =
-        load_dev_fmt(m, pf, 2, (long[]){D, FFN}, "%s.linear2.weight", prefix);
+        load_dev_w_fmt(m, pf, 2, (long[]){D, FFN}, "%s.linear2.weight", prefix);
     l->l2b = vec_dev(m, pf, prefix, "linear2.bias");
 }
 
@@ -203,10 +204,10 @@ static void load_dlayer(struct sam_model *m, const struct pth_file *pf,
     l->ctw = vec_dev(m, pf, prefix, "catext_norm.weight");
     l->ctb = vec_dev(m, pf, prefix, "catext_norm.bias");
     l->l1w =
-        load_dev_fmt(m, pf, 2, (long[]){FFN, D}, "%s.linear1.weight", prefix);
+        load_dev_w_fmt(m, pf, 2, (long[]){FFN, D}, "%s.linear1.weight", prefix);
     l->l1b = load_dev_fmt(m, pf, 1, (long[]){FFN}, "%s.linear1.bias", prefix);
     l->l2w =
-        load_dev_fmt(m, pf, 2, (long[]){D, FFN}, "%s.linear2.weight", prefix);
+        load_dev_w_fmt(m, pf, 2, (long[]){D, FFN}, "%s.linear2.weight", prefix);
     l->l2b = vec_dev(m, pf, prefix, "linear2.bias");
 }
 
@@ -419,15 +420,16 @@ static void encode_prompts(struct sam3_text *t, const struct pth_file *pf,
         w = load_host(pf, name, 2, (long[]){3 * W, W});
         snprintf(name, sizeof(name), "%s.%d.attn.in_proj_bias", p, l);
         bb = load_host(pf, name, 1, (long[]){3 * W});
-        b->qw = ocl_upload(ocl, w, msz, name);
-        b->kw = ocl_upload(ocl, w + W * W, msz, name);
-        b->vw = ocl_upload(ocl, w + 2 * W * W, msz, name);
+        b->qw = ocl_upload_weight(ocl, w, msz / sizeof(float), name);
+        b->kw = ocl_upload_weight(ocl, w + W * W, msz / sizeof(float), name);
+        b->vw =
+            ocl_upload_weight(ocl, w + 2 * W * W, msz / sizeof(float), name);
         b->qb = ocl_upload(ocl, bb, vsz, name);
         b->kb = ocl_upload(ocl, bb + W, vsz, name);
         b->vb = ocl_upload(ocl, bb + 2 * W, vsz, name);
         G_free(w);
         G_free(bb);
-        b->ow = load_dev_fmt(m, pf, 2, (long[]){W, W},
+        b->ow = load_dev_w_fmt(m, pf, 2, (long[]){W, W},
                              "%s.%d.attn.out_proj.weight", p, l);
         b->ob = load_dev_fmt(m, pf, 1, (long[]){W}, "%s.%d.attn.out_proj.bias",
                              p, l);
@@ -435,18 +437,18 @@ static void encode_prompts(struct sam3_text *t, const struct pth_file *pf,
         b->n1b = load_dev_fmt(m, pf, 1, (long[]){W}, "%s.%d.ln_1.bias", p, l);
         b->n2w = load_dev_fmt(m, pf, 1, (long[]){W}, "%s.%d.ln_2.weight", p, l);
         b->n2b = load_dev_fmt(m, pf, 1, (long[]){W}, "%s.%d.ln_2.bias", p, l);
-        b->fw = load_dev_fmt(m, pf, 2, (long[]){Fw, W}, "%s.%d.mlp.c_fc.weight",
+        b->fw = load_dev_w_fmt(m, pf, 2, (long[]){Fw, W}, "%s.%d.mlp.c_fc.weight",
                              p, l);
         b->fb =
             load_dev_fmt(m, pf, 1, (long[]){Fw}, "%s.%d.mlp.c_fc.bias", p, l);
-        b->pw = load_dev_fmt(m, pf, 2, (long[]){W, Fw},
+        b->pw = load_dev_w_fmt(m, pf, 2, (long[]){W, Fw},
                              "%s.%d.mlp.c_proj.weight", p, l);
         b->pb =
             load_dev_fmt(m, pf, 1, (long[]){W}, "%s.%d.mlp.c_proj.bias", p, l);
     }
     lfw = load_dev(m, pf, TXT ".encoder.ln_final.weight", 1, (long[]){W});
     lfb = load_dev(m, pf, TXT ".encoder.ln_final.bias", 1, (long[]){W});
-    rw = load_dev(m, pf, TXT ".resizer.weight", 2, (long[]){D, W});
+    rw = load_dev_w(m, pf, TXT ".resizer.weight", 2, (long[]){D, W});
     rb = load_dev(m, pf, TXT ".resizer.bias", 1, (long[]){D});
 
     tx = ocl_alloc(ocl, TOK_CONTEXT * W * sizeof(float), "text tokens");
