@@ -170,6 +170,39 @@ text encoder, detector and tracker memory are not loaded) and the work
 buffers 2497 MiB with <b>batch</b>=32; a smaller <b>batch</b> reduces the mask
 decoder's share. Buffers are kept below the device's maximum allocation
 size.</p>
+<h3>Device profile and precision</h3>
+<p>The <b>profile</b> chooses how buffers are allocated and which matrix
+product kernels run, to suit the device:</p>
+<ul>
+<li><em>cpu</em>: a device working in host memory, such as PoCL. Buffers are
+  mapped instead of copied, and the matrix products use kernels without
+  local memory that stream rows with 8-wide vector loads, which PoCL
+  runs far better than the GPU kernels.</li>
+<li><em>igpu</em>: a GPU sharing host memory (integrated graphics, APU). Buffers
+  are allocated in host memory and written and read by mapping them
+  (zero-copy), so no transfer crosses the memory bus twice.</li>
+<li><em>dgpu</em>: a GPU with its own memory on internal PCI Express. Buffers
+  live in device memory.</li>
+<li><em>egpu</em>: a GPU behind a slow link, such as a Thunderbolt or USB4
+  enclosure. Buffers live in device memory and large transfers go
+  through a pinned staging buffer. The weights stay on the device for
+  the whole run.</li>
+</ul>
+<p>With <b>profile</b>=<em>auto</em> the profile is detected: <em>cpu</em> for a CPU
+device, <em>igpu</em> for a GPU that reports unified memory, <em>egpu</em> for a GPU
+whose PCI function Linux marks as removable (when the driver reports
+its PCI address), <em>dgpu</em> otherwise. The chosen profile and the reason
+are printed. A profile can be forced to compare them; every profile
+gives the same results, only the speed differs.</p>
+<p><b>precision</b>=<em>fp16</em> stores the weight matrices of the linear layers
+(most of the model's memory) as IEEE half-precision numbers, read with
+the core OpenCL <code>vload_half</code> functions, so no half-precision extension
+is needed; the arithmetic stays in single precision. It halves their
+memory and the bytes read by the matrix products, which matters on
+devices limited by memory bandwidth (integrated GPUs, CPUs). Rounding
+the weights to half precision changes the masks slightly; check the
+result against <b>precision</b>=<em>fp32</em> (the default) on a sample before
+relying on it.</p>
 <h3>Performance</h3>
 <p>On a CPU (Intel Core i7-1165G7, 4 cores, PoCL), the image encoder took
 about 1020 s per crop and the mask decoder about 46 s per 64 prompts;
@@ -198,7 +231,7 @@ the first prompt's text features) and the list of masks are written
 there. The scripts <code>tests/reference_compare.py</code> and
 <code>tests/reference_compare_text.py</code> in the source tree compare them with
 the PyTorch reference implementation.
-<code>I_SAM3_OPENCL_PROFILE=1</code> prints the time spent in each OpenCL kernel.
+<code>I_SAM3_OPENCL_PROFILE=1</code> prints the time spent in each OpenCL kernel. Each line gives the event time and the wall-clock time (some drivers, such as rusticl on Intel iris, report wrong event times), and for the matrix products the achieved GFLOP/s, which shows whether a kernel is limited by compute or by memory bandwidth.
 <code>I_SAM3_OPENCL_DOWNLOAD_URL</code> replaces the download location
 (<code>https://huggingface.co/facebook/sam3/resolve/main</code>), for a local
 mirror.</p>

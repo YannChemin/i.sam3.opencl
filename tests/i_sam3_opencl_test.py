@@ -377,3 +377,49 @@ def test_download_fetches_missing_model(session, checkpoint, tmp_path, mirror):
         )
     assert (weights / "sam3.pt").stat().st_size == SAM3_SIZE
     assert not list(weights.glob("*.part"))
+
+
+@pytest.mark.parametrize("option", ["profile", "precision"])
+def test_rejects_invalid_device_option(session, tmp_path, option):
+    """profile= and precision= only take their listed values."""
+    tools = Tools(session=session)
+    with pytest.raises(ToolError):
+        tools.i_sam3_opencl(
+            group="rgb",
+            checkpoint=str(tmp_path / "missing.pt"),
+            output="out",
+            **{option: "nonsense"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile", "precision"), [("cpu", "fp32"), ("igpu", "fp32"), ("dgpu", "fp16")]
+)
+def test_profiles_and_precision_give_the_rectangles(
+    session, checkpoint, device_options, profile, precision
+):
+    """A forced device profile, and half-precision weights, still recover
+    every rectangle at the right size."""
+    tools = Tools(session=session)
+    out = f"seg_{profile}_{precision}"
+    tools.i_sam3_opencl(
+        group="rgb",
+        checkpoint=checkpoint,
+        output=out,
+        raster=out,
+        points_per_side=8,
+        minsize=50,
+        profile=profile,
+        precision=precision,
+        **device_options,
+    )
+    for name, n, s, w, e, _ in RECTANGLES:
+        x, y = (w + e) // 2 - 0.5, 256 - (n + s) // 2 + 0.5
+        cat = tools.r_what(map=out, coordinates=(x, y), format="json").json[0][out][
+            "value"
+        ]
+        assert cat is not None, f"{name} rectangle not segmented"
+        row = tools.v_db_select(map=out, where=f"cat = {cat}", format="json").json[
+            "records"
+        ][0]
+        assert row["cells"] == pytest.approx((s - n + 1) * (e - w + 1), rel=0.05)
