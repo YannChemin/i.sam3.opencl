@@ -36,8 +36,8 @@ def _write_checkpoint(path, shapes):
     FloatStorage.__qualname__ = "FloatStorage"
     _rebuild_tensor_v2.__module__ = "torch._utils"
     _rebuild_tensor_v2.__qualname__ = "_rebuild_tensor_v2"
-    torch_mod.FloatStorage = FloatStorage
-    utils_mod._rebuild_tensor_v2 = _rebuild_tensor_v2
+    vars(torch_mod)["FloatStorage"] = FloatStorage
+    vars(utils_mod)["_rebuild_tensor_v2"] = _rebuild_tensor_v2
 
     class Storage:
         def __init__(self, key, numel):
@@ -330,7 +330,7 @@ def mirror(tmp_path):
     root.mkdir()
 
     class Quiet(http.server.SimpleHTTPRequestHandler):
-        def log_message(self, *args):
+        def log_message(self, format, *args):
             pass
 
     handler = functools.partial(Quiet, directory=str(root))
@@ -358,9 +358,9 @@ def test_download_fetches_missing_model(session, checkpoint, tmp_path, mirror):
     """sam3.pt missing from the weights folder (created if needed) is
     downloaded there and used."""
     if Path(checkpoint).stat().st_size != SAM3_SIZE:
-        pytest.skip("checkpoint is not the published sam3.pt")
+        pytest.skip("checkpoint is not the published sam3.pt")  # ty: ignore[too-many-positional-arguments]
     if shutil.disk_usage(tmp_path).free < 2 * SAM3_SIZE:
-        pytest.skip(f"not enough free space in {tmp_path} for a copy of sam3.pt")
+        pytest.skip(f"not enough free space in {tmp_path} for a copy of sam3.pt")  # ty: ignore[too-many-positional-arguments]
     root, url = mirror
     (root / "sam3.pt").symlink_to(checkpoint)
     weights = tmp_path / "new" / "weights"

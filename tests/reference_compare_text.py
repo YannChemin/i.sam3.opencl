@@ -27,8 +27,8 @@ import re
 import numpy as np
 import torch
 from PIL import Image
-from sam3.model.sam3_image_processor import Sam3Processor
-from sam3.model_builder import build_sam3_image_model
+from sam3.model.sam3_image_processor import Sam3Processor  # ty: ignore[unresolved-import]
+from sam3.model_builder import build_sam3_image_model  # ty: ignore[unresolved-import]
 from torchvision.transforms import v2
 
 
@@ -62,7 +62,7 @@ def cpu_only():
     ):
         setattr(torch, name, on_cpu(getattr(torch, name)))
     # Pinned host memory needs an accelerator.
-    torch.Tensor.pin_memory = lambda self, *args, **kwargs: self
+    torch.Tensor.pin_memory = lambda self, *args, **kwargs: self  # ty: ignore[invalid-assignment]
 
 
 def load_dump(dump_dir, name, shape):
@@ -96,7 +96,10 @@ def main():
     args = parser.parse_args()
 
     rgb_path = min(glob.glob(os.path.join(args.dump_dir, "crop000_rgb_*.u8")))
-    h, w = map(int, re.search(r"_(\d+)x(\d+)\.u8$", rgb_path).groups())
+    size = re.search(r"_(\d+)x(\d+)\.u8$", rgb_path)
+    if size is None:
+        raise ValueError(f"no crop size in the dump name {rgb_path}")
+    h, w = map(int, size.groups())
     rgb = np.fromfile(rgb_path, dtype=np.uint8).reshape(h, w, 3)
     inp = load_dump(args.dump_dir, "input", (3, 1008, 1008))
     det = load_dump(args.dump_dir, "detector", (72, 72, 256))
