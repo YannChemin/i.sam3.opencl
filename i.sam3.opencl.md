@@ -181,9 +181,10 @@ product kernels run, to suit the device:
   mapped instead of copied, and the matrix products use kernels without
   local memory that stream rows with 8-wide vector loads, which PoCL
   runs far better than the GPU kernels.
-- *igpu*: a GPU sharing host memory (integrated graphics, APU). Buffers
-  are allocated in host memory and written and read by mapping them
-  (zero-copy), so no transfer crosses the memory bus twice.
+- *igpu*: a GPU sharing host memory (integrated graphics, APU). Transfers
+  map the buffers instead of copying them; the driver places the
+  buffers (on Intel, buffers allocated in host memory slowed the
+  kernels by about 15 %).
 - *dgpu*: a GPU with its own memory on internal PCI Express. Buffers
   live in device memory.
 - *egpu*: a GPU behind a slow link, such as a Thunderbolt or USB4

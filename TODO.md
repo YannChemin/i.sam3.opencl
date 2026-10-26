@@ -7,11 +7,11 @@
 CPU, float and half weights) matches a host reference on PoCL, rusticl
 and Intel compute-runtime. Still open:
 
-- [ ] Full-model check of `profile=cpu` (speed against the GPU kernels on
-      PoCL) and of `precision=fp16` (masks against fp32) on a real crop;
-      the checkpoint-gated tests cover the rectangles image.
-- [ ] Install into `/usr/local/grass86` once that check passes (only the
-      dev tree is built).
+- [x] Full-model check on a real crop (2026-10-26, mains power): every
+      fp32 profile gives the same masks (IoU 1.0); fp16 weights give
+      coverage IoU 0.999. i.sam3.opencl: PoCL 1,092 s -> 165 s with
+      `profile=cpu`; Iris Xe 11.2 s (Intel runtime), 49.9 s (rusticl).
+- [x] Installed into `/usr/local/grass86`.
 - [ ] Intel GPUs: on mains power `gemm_big` reaches about 970 GFLOP/s
       (46 % of peak) on the Iris Xe; a 4x4-block variant reached 720 and
       was dropped on 2026-10-26. Next: `cl_intel_subgroups` block reads,

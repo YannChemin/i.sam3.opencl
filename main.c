@@ -414,7 +414,7 @@ int main(int argc, char *argv[])
                "auto;%s;cpu;%s;igpu;%s;dgpu;%s;egpu;%s",
                _("Detect from the device"),
                _("Host-memory device (PoCL): mapped buffers, CPU kernels"),
-               _("GPU sharing host memory: zero-copy buffers"),
+               _("GPU sharing host memory: mapped transfers"),
                _("GPU with its own memory on internal PCIe"),
                _("GPU behind a slow link (Thunderbolt, remote): pinned "
                  "staging"));

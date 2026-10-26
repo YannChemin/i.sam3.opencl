@@ -16,8 +16,8 @@
  * and the GEMM kernels:
  * - cpu:  host-memory device (PoCL): mapped buffers, GEMM kernels
  *         without local memory, vectorised along the contiguous axis.
- * - igpu: GPU sharing host memory: zero-copy buffers (allocated in host
- *         memory, written and read by mapping instead of copying).
+ * - igpu: GPU sharing host memory: transfers by mapping instead of
+ *         copying; the driver places the buffers.
  * - dgpu: GPU with its own memory on internal PCIe: device buffers.
  * - egpu: GPU behind a slow link (Thunderbolt, PoCL-Remote): device
  *         buffers, transfers through a pinned staging buffer. */
